@@ -3,13 +3,19 @@ import { open } from '@tauri-apps/plugin-dialog';
 
 export type AppConfig = {
   scannedRoot: string | null;
+  pinnedFolders: string[];
+  ignoredFolders: string[];
 };
+
+export type CourseSource = 'scanned' | 'pinned';
 
 export type CourseEntry = {
   folder: string;
   title: string;
   modified_ms: number;
   video_count: number;
+  source: CourseSource;
+  missing: boolean;
 };
 
 export const getConfig = () => invoke<AppConfig>('get_config');
@@ -23,8 +29,16 @@ export const defaultScannedRoot = () =>
 export const createCourse = (root: string, title: string) =>
   invoke<string>('create_course', { root, title });
 
-export const scanLibrary = (root: string) =>
-  invoke<CourseEntry[]>('scan_library', { root });
+export const listLibrary = () => invoke<CourseEntry[]>('list_library');
+
+export const addExistingCourse = (folder: string) =>
+  invoke<AppConfig>('add_existing_course', { folder });
+
+export const removeFromLibrary = (folder: string) =>
+  invoke<AppConfig>('remove_from_library', { folder });
+
+export const moveCourseToTrash = (folder: string) =>
+  invoke<AppConfig>('move_course_to_trash', { folder });
 
 export const renameCourse = (folder: string, newTitle: string) =>
   invoke<string>('rename_course', { folder, newTitle });
@@ -83,6 +97,15 @@ export const pickDirectory = async (defaultPath?: string | null) => {
     multiple: false,
     defaultPath: defaultPath ?? undefined,
     title: 'Choose a folder to scan for Courses'
+  });
+  return typeof result === 'string' ? result : null;
+};
+
+export const pickExistingCourseFolder = async () => {
+  const result = await open({
+    directory: true,
+    multiple: false,
+    title: 'Pick a Course Folder to add to your Library'
   });
   return typeof result === 'string' ? result : null;
 };

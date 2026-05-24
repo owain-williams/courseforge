@@ -1,0 +1,12 @@
+node_modules
+.svelte-kit
+build
+dist
+.DS_Store
+
+# Claude Code session state
+.claude/
+
+# Tauri
+src-tauri/target
+src-tauri/gen/schemas

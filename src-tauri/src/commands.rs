@@ -239,6 +239,10 @@ pub fn open_course_window(
                 .title(format!("{} — Courseforge", course.title))
                 .inner_size(1000.0, 720.0)
                 .min_inner_size(700.0, 480.0)
+                // Tauri's OS-level file-drop interceptor swallows HTML5
+                // drag events before the webview sees them; turn it off so
+                // the kanban board's native drag-and-drop works.
+                .disable_drag_drop_handler()
                 .build()
                 .map_err(|e| AppError { message: format!("failed to open course window: {e}") })?;
 

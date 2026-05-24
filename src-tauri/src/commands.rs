@@ -169,6 +169,39 @@ pub fn delete_video(folder: PathBuf, video_id: String) -> Result<(), AppError> {
 }
 
 #[tauri::command]
+pub fn add_workflow_state(folder: PathBuf, name: String) -> Result<course::WorkflowState, AppError> {
+    Ok(course::add_workflow_state(&folder, &name)?)
+}
+
+#[tauri::command]
+pub fn rename_workflow_state(
+    folder: PathBuf,
+    state_id: String,
+    new_name: String,
+) -> Result<(), AppError> {
+    Ok(course::rename_workflow_state(&folder, &state_id, &new_name)?)
+}
+
+#[tauri::command]
+pub fn reorder_workflow_states(folder: PathBuf, ordered_ids: Vec<String>) -> Result<(), AppError> {
+    Ok(course::reorder_workflow_states(&folder, &ordered_ids)?)
+}
+
+#[tauri::command]
+pub fn remove_workflow_state(
+    folder: PathBuf,
+    state_id: String,
+    fallback_state_id: String,
+) -> Result<(), AppError> {
+    Ok(course::remove_workflow_state(&folder, &state_id, &fallback_state_id)?)
+}
+
+#[tauri::command]
+pub fn set_video_state(folder: PathBuf, video_id: String, state_id: String) -> Result<(), AppError> {
+    Ok(course::set_video_state(&folder, &video_id, &state_id)?)
+}
+
+#[tauri::command]
 pub fn move_video_to_module(
     folder: PathBuf,
     video_id: String,

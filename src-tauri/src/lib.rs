@@ -27,6 +27,11 @@ pub fn run() {
             commands::reorder_videos_in_module,
             commands::delete_video,
             commands::move_video_to_module,
+            commands::add_workflow_state,
+            commands::rename_workflow_state,
+            commands::reorder_workflow_states,
+            commands::remove_workflow_state,
+            commands::set_video_state,
             commands::open_course_window,
             commands::get_window_course_folder,
         ])

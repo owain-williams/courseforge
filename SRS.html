@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Courseforge — Software Requirements Specification</title>
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --fg-soft: #555;
+    --fg-faint: #888;
+    --bg: #fdfdfc;
+    --bg-soft: #f4f2ee;
+    --rule: #e3dfd8;
+    --accent: #8b3a1f;
+    --accent-soft: #c87a55;
+    --code-bg: #f0ede6;
+    --vnext-bg: #fff7e6;
+    --vnext-border: #e6c87a;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+  }
+
+  body {
+    font-family: "Charter", "Iowan Old Style", "Georgia", serif;
+    font-size: 17px;
+    line-height: 1.6;
+  }
+
+  code, pre, .mono {
+    font-family: "SF Mono", "Menlo", "Consolas", monospace;
+    font-size: 0.9em;
+  }
+
+  code {
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  /* Layout: sticky TOC + main column */
+  .layout {
+    display: grid;
+    grid-template-columns: 260px minmax(0, 1fr);
+    max-width: 1180px;
+    margin: 0 auto;
+    gap: 48px;
+    padding: 32px 32px 96px;
+  }
+
+  nav.toc {
+    position: sticky;
+    top: 32px;
+    align-self: start;
+    max-height: calc(100vh - 64px);
+    overflow-y: auto;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    font-size: 13.5px;
+    line-height: 1.5;
+    border-right: 1px solid var(--rule);
+    padding-right: 16px;
+  }
+
+  nav.toc h2 {
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fg-faint);
+    margin: 0 0 12px;
+    font-weight: 600;
+  }
+
+  nav.toc ol {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    counter-reset: toc;
+  }
+
+  nav.toc > ol > li {
+    counter-increment: toc;
+    margin-bottom: 8px;
+  }
+
+  nav.toc > ol > li > a::before {
+    content: counter(toc) ". ";
+    color: var(--fg-faint);
+  }
+
+  nav.toc ol ol {
+    counter-reset: toc-sub;
+    padding-left: 16px;
+    margin-top: 4px;
+  }
+
+  nav.toc ol ol li {
+    counter-increment: toc-sub;
+    margin-bottom: 2px;
+  }
+
+  nav.toc ol ol li > a::before {
+    content: counters(toc, ".") "." counter(toc-sub) " ";
+    color: var(--fg-faint);
+  }
+
+  nav.toc a {
+    color: var(--fg-soft);
+    text-decoration: none;
+    display: block;
+    padding: 2px 0;
+  }
+
+  nav.toc a:hover { color: var(--accent); }
+
+  main { min-width: 0; }
+
+  /* Header */
+  header.doc-header {
+    margin-bottom: 48px;
+    padding-bottom: 24px;
+    border-bottom: 2px solid var(--fg);
+  }
+
+  header.doc-header .eyebrow {
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    font-size: 12px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+
+  header.doc-header h1 {
+    font-size: 42px;
+    line-height: 1.15;
+    margin: 0 0 8px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+
+  header.doc-header .subtitle {
+    color: var(--fg-soft);
+    font-size: 19px;
+    font-style: italic;
+    margin: 0 0 24px;
+  }
+
+  .meta-grid {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 4px 24px;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    font-size: 13px;
+    color: var(--fg-soft);
+  }
+
+  .meta-grid dt { font-weight: 600; color: var(--fg); }
+  .meta-grid dd { margin: 0; }
+
+  /* Section structure */
+  section {
+    margin-bottom: 56px;
+    counter-reset: requirement;
+  }
+
+  h2 {
+    font-size: 28px;
+    margin: 0 0 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--rule);
+    letter-spacing: -0.01em;
+    scroll-margin-top: 24px;
+  }
+
+  h3 {
+    font-size: 20px;
+    margin: 36px 0 8px;
+    color: var(--accent);
+    scroll-margin-top: 24px;
+  }
+
+  h4 {
+    font-size: 16px;
+    margin: 24px 0 4px;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    font-weight: 600;
+    color: var(--fg);
+  }
+
+  p { margin: 0 0 14px; }
+
+  ul, ol { margin: 0 0 16px; padding-left: 22px; }
+  li { margin-bottom: 4px; }
+
+  /* Requirements */
+  .reqs {
+    list-style: none;
+    padding: 0;
+    margin: 16px 0;
+    border-top: 1px solid var(--rule);
+  }
+
+  .reqs li {
+    display: grid;
+    grid-template-columns: 88px 1fr;
+    gap: 16px;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--rule);
+    margin: 0;
+  }
+
+  .reqs .id {
+    font-family: "SF Mono", "Menlo", monospace;
+    font-size: 12px;
+    color: var(--accent);
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    padding-top: 3px;
+  }
+
+  .reqs .body { margin: 0; }
+
+  .reqs .body strong { font-weight: 600; }
+
+  /* v-next callout */
+  .vnext {
+    background: var(--vnext-bg);
+    border-left: 3px solid var(--vnext-border);
+    padding: 10px 14px;
+    margin: 12px 0;
+    font-size: 14.5px;
+    color: var(--fg-soft);
+    border-radius: 0 4px 4px 0;
+  }
+
+  .vnext::before {
+    content: "v-next  ";
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    font-size: 10.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    font-weight: 700;
+    color: #8a6d1f;
+  }
+
+  /* Inline tags */
+  .tag {
+    display: inline-block;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    font-size: 10.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-weight: 600;
+    padding: 1px 7px;
+    border-radius: 3px;
+    vertical-align: 1px;
+    margin-left: 6px;
+  }
+
+  .tag.v1 { background: #e6f0e6; color: #2f6b2f; }
+  .tag.vnext { background: var(--vnext-bg); color: #8a6d1f; }
+  .tag.tbd { background: #eee; color: var(--fg-soft); }
+
+  /* Callout box for product summary */
+  .summary-box {
+    background: var(--bg-soft);
+    border-radius: 6px;
+    padding: 20px 24px;
+    margin: 0 0 24px;
+    font-size: 17px;
+  }
+
+  .summary-box p:last-child { margin-bottom: 0; }
+
+  /* Glossary */
+  dl.glossary dt {
+    font-weight: 600;
+    margin-top: 14px;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  }
+
+  dl.glossary dd {
+    margin: 2px 0 0;
+    color: var(--fg-soft);
+  }
+
+  /* Print */
+  @media print {
+    nav.toc { display: none; }
+    .layout { display: block; max-width: none; padding: 0; }
+    body { font-size: 11pt; }
+    h2 { page-break-before: auto; break-before: auto; }
+    section { page-break-inside: avoid; }
+    header.doc-header { page-break-after: avoid; }
+    .vnext { background: transparent; }
+  }
+
+  /* Narrow viewports */
+  @media (max-width: 800px) {
+    .layout {
+      grid-template-columns: 1fr;
+      padding: 24px 20px 64px;
+      gap: 24px;
+    }
+    nav.toc {
+      position: static;
+      max-height: none;
+      border-right: none;
+      border-bottom: 1px solid var(--rule);
+      padding-right: 0;
+      padding-bottom: 16px;
+    }
+    header.doc-header h1 { font-size: 32px; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<nav class="toc" aria-label="Table of Contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#introduction">Introduction</a>
+      <ol>
+        <li><a href="#purpose">Purpose</a></li>
+        <li><a href="#scope">Scope</a></li>
+        <li><a href="#audience">Intended Audience</a></li>
+        <li><a href="#conventions">Conventions</a></li>
+      </ol>
+    </li>
+    <li><a href="#product-overview">Product Overview</a>
+      <ol>
+        <li><a href="#vision">Vision</a></li>
+        <li><a href="#users">Target Users</a></li>
+        <li><a href="#values">Product Values</a></li>
+      </ol>
+    </li>
+    <li><a href="#system">System Context</a>
+      <ol>
+        <li><a href="#platform">Platform &amp; Stack</a></li>
+        <li><a href="#data-model">Course Data Model</a></li>
+      </ol>
+    </li>
+    <li><a href="#functional">Functional Requirements</a>
+      <ol>
+        <li><a href="#fr-library">Course Library &amp; Skeleton</a></li>
+        <li><a href="#fr-ai">AI Ideation</a></li>
+        <li><a href="#fr-recording">Recording</a></li>
+        <li><a href="#fr-workflow">Workflow Tagging</a></li>
+        <li><a href="#fr-transcript">Transcript-Based Editing</a></li>
+        <li><a href="#fr-effects">Effects &amp; Plugins</a></li>
+        <li><a href="#fr-export">Export</a></li>
+      </ol>
+    </li>
+    <li><a href="#non-functional">Non-Functional Requirements</a></li>
+    <li><a href="#out-of-scope">Out of Scope (v1)</a></li>
+    <li><a href="#vnext">v-next Roadmap</a></li>
+    <li><a href="#glossary">Glossary</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<header class="doc-header">
+  <div class="eyebrow">Software Requirements Specification</div>
+  <h1>Courseforge <span class="tag tbd">name TBD</span></h1>
+  <p class="subtitle">A local-first macOS desktop app for solo course creators — ideate, record, edit, and export online video courses end to end.</p>
+  <dl class="meta-grid">
+    <dt>Document</dt>     <dd>SRS · high-level vision</dd>
+    <dt>Status</dt>       <dd>Draft v0.1 — for decomposition into per-feature design docs</dd>
+    <dt>Date</dt>         <dd>2026-05-24</dd>
+    <dt>Owner</dt>        <dd>owain@andersdigital.com</dd>
+  </dl>
+</header>
+
+<section id="introduction">
+  <h2>1. Introduction</h2>
+
+  <h3 id="purpose">1.1 Purpose</h3>
+  <p>This document captures the high-level requirements for <em>Courseforge</em>, a macOS desktop application that lets a solo course creator produce a complete online video course inside a single tool — from initial ideation through recording, editing, and export.</p>
+  <p>The SRS is intentionally vision-level. It exists to (a) establish shared understanding of what the product is and is not, and (b) act as a feature menu from which individual features will be peeled off and given their own detailed design documents prior to implementation.</p>
+
+  <h3 id="scope">1.2 Scope</h3>
+  <p>Courseforge is a <strong>creation tool</strong>. It produces the artifacts of an online course (video files, transcripts, captions, and a structured manifest describing the course) and hands them off to the user. It does <strong>not</strong> host the courses, serve them to students, handle payments, track student progress, or otherwise behave as a Learning Management System.</p>
+  <p>The user takes the exported artifacts and publishes them wherever they wish — YouTube, Vimeo, Teachable, Thinkific, a private S3 bucket, etc. Direct upload integrations to those destinations are an explicit <em>v-next</em> goal, not a v1 requirement.</p>
+
+  <h3 id="audience">1.3 Intended Audience</h3>
+  <p>This document is written for the project owner and any future contributors (engineers, designers, AI coding agents) who need a stable description of the product to work against. It assumes a software-engineering reader; it does not assume domain expertise in video editing or LMS conventions.</p>
+
+  <h3 id="conventions">1.4 Conventions</h3>
+  <ul>
+    <li>Requirements are identified <code>FR-X.Y.Z</code> (functional) or <code>NFR-Y</code> (non-functional).</li>
+    <li>The keyword <strong>must</strong> denotes a v1 requirement.</li>
+    <li>The keyword <strong>should</strong> denotes a v1 recommendation that may slip if necessary.</li>
+    <li>Inline tags <span class="tag v1">v1</span> and <span class="tag vnext">v-next</span> flag which release a requirement belongs to.</li>
+    <li>"v-next" is shorthand for "after v1" — it is not a single planned release, just the bucket of named-but-deferred work.</li>
+  </ul>
+</section>
+
+<section id="product-overview">
+  <h2>2. Product Overview</h2>
+
+  <h3 id="vision">2.1 Vision</h3>
+  <div class="summary-box">
+    <p>A single macOS app where a course creator can sit down, brainstorm a course with AI, record every video in it, edit those videos surgically by editing their transcripts, polish them with effects, and export a publish-ready bundle — without ever uploading anything to a third party along the way.</p>
+    <p>The app treats the course (not the individual video) as the primary unit of work, and treats the user's local disk as the only place their work lives.</p>
+  </div>
+
+  <h3 id="users">2.2 Target Users</h3>
+  <p>The primary user is a <strong>solo course creator</strong>: an individual producing a structured video course for sale or distribution. They are typically subject-matter experts rather than professional video editors. They are comfortable installing desktop software and bringing their own API key for AI features.</p>
+  <p>Examples of the kind of course a primary user might produce: a guitar instruction course, a programming language tutorial, a yoga series, a corporate-skills training set.</p>
+
+  <h3 id="values">2.3 Product Values</h3>
+  <p>The following values should be considered when resolving any design tradeoff during implementation:</p>
+  <ul>
+    <li><strong>Local-first.</strong> No accounts, no telemetry, no required cloud services. The user's content lives on their disk and stays there until they choose to publish it.</li>
+    <li><strong>Bring-your-own-key.</strong> Any AI features call providers using credentials the user supplies. Courseforge never proxies AI calls through its own servers and never charges the user for AI usage.</li>
+    <li><strong>End-to-end in one tool.</strong> The user should not need a separate app to record, edit, or transcribe. Switching tools mid-flow breaks creative momentum.</li>
+    <li><strong>Crash-resilient by default.</strong> Long recording sessions and in-progress edits must survive an unexpected crash without data loss.</li>
+    <li><strong>Portable artifacts.</strong> A course is a self-contained folder on disk that the user can copy, zip, back up, or move to another Mac with no special export step.</li>
+  </ul>
+</section>
+
+<section id="system">
+  <h2>3. System Context</h2>
+
+  <h3 id="platform">3.1 Platform &amp; Stack</h3>
+  <ul>
+    <li><strong>Platform:</strong> macOS only (v1). No Windows or Linux support is planned.</li>
+    <li><strong>Application framework:</strong> Tauri, with the application core written in Rust.</li>
+    <li><strong>Persistence:</strong> Local filesystem. No required network services. No bundled server.</li>
+    <li><strong>Credentials:</strong> AI provider keys are stored in the macOS Keychain.</li>
+    <li><strong>OS integration:</strong> Recording capabilities depend on macOS-native APIs (ScreenCaptureKit for screen and system audio, AVFoundation for camera and microphone). The app must request and respect the relevant macOS permissions (Screen Recording, Camera, Microphone).</li>
+  </ul>
+
+  <h3 id="data-model">3.2 Course Data Model</h3>
+  <p>The conceptual hierarchy is intentionally shallow:</p>
+  <ul>
+    <li>A <strong>Course</strong> contains an ordered list of <strong>Modules</strong>.</li>
+    <li>A <strong>Module</strong> contains an ordered list of <strong>Videos</strong>.</li>
+    <li>A <strong>Video</strong> is a timeline composed of one or more recorded <strong>Segments</strong> (and, once implemented, applied effects and transcript-edit decisions).</li>
+  </ul>
+  <p>This two-level structure (Course → Module → Video) is fixed for v1. Deeper nesting (sub-modules, sections, lessons) is explicitly out of scope; users who need finer grouping can use additional top-level Modules. A richer hierarchy may be revisited later if real usage demands it.</p>
+</section>
+
+<section id="functional">
+  <h2>4. Functional Requirements</h2>
+
+  <h3 id="fr-library">4.1 Course Library &amp; Skeleton</h3>
+  <ol class="reqs">
+    <li><span class="id">FR-1.1</span><p class="body">The app <strong>must</strong> open to a <em>library view</em> that lists all of the user's courses with their titles and basic status (e.g., last modified, video count).</p></li>
+    <li><span class="id">FR-1.2</span><p class="body">The user <strong>must</strong> be able to create a new course, open an existing course, rename a course, and delete a course.</p></li>
+    <li><span class="id">FR-1.3</span><p class="body">A course <strong>must</strong> be persisted as a self-contained folder on the user's disk, containing all of its videos, transcripts, project state, and metadata. Copying this folder elsewhere must produce a fully usable course on import.</p></li>
+    <li><span class="id">FR-1.4</span><p class="body">Within an opened course, the user <strong>must</strong> be able to view, add, rename, reorder, and delete Modules and Videos.</p></li>
+    <li><span class="id">FR-1.5</span><p class="body">The app <strong>should</strong> support having multiple courses open simultaneously (multi-window).</p></li>
+  </ol>
+
+  <h3 id="fr-ai">4.2 AI Ideation</h3>
+  <ol class="reqs">
+    <li><span class="id">FR-2.1</span><p class="body">The user <strong>must</strong> be able to generate a proposed course skeleton (Modules and Video titles) from a high-level prompt describing the course they want to make.</p></li>
+    <li><span class="id">FR-2.2</span><p class="body">The user <strong>must</strong> be able to review, accept, edit, or regenerate the AI-proposed skeleton before it becomes their working course structure.</p></li>
+    <li><span class="id">FR-2.3</span><p class="body">All AI calls <strong>must</strong> use the user's own API key (bring-your-own-key). The key <strong>must</strong> be stored in the macOS Keychain and never transmitted to any Courseforge-operated service.</p></li>
+    <li><span class="id">FR-2.4</span><p class="body">v1 <strong>must</strong> support at least one AI provider (target: Anthropic / Claude). The implementation <strong>should</strong> be structured so that additional providers can be added later without a rewrite.</p></li>
+    <li><span class="id">FR-2.5</span><p class="body">If the user has not configured an API key, AI ideation features <strong>must</strong> degrade gracefully — the app remains fully usable for manual course creation, recording, and editing.</p></li>
+  </ol>
+  <div class="vnext">Multi-provider AI (OpenAI, Gemini, local models), and a persistent AI chat panel for ongoing refinement of an existing course, are explicit v-next goals.</div>
+
+  <h3 id="fr-recording">4.3 Recording</h3>
+  <ol class="reqs">
+    <li><span class="id">FR-3.1</span><p class="body">The user <strong>must</strong> be able to select a specific Video slot in the course skeleton and start a recording session that captures into that slot.</p></li>
+    <li><span class="id">FR-3.2</span><p class="body">A recording session <strong>must</strong> be able to capture any combination of: <strong>screen</strong> (full display or chosen window), <strong>webcam</strong>, <strong>microphone</strong>, and <strong>system audio</strong>.</p></li>
+    <li><span class="id">FR-3.3</span><p class="body">A single Video may contain multiple recorded Segments (e.g., a re-take, an inserted screencast, an outro recorded separately). The app <strong>must</strong> support appending additional Segments to an existing Video and reordering them.</p></li>
+    <li><span class="id">FR-3.4</span><p class="body">All recordings <strong>must</strong> be written to a crash-resilient container (target: <strong>Matroska / MKV</strong>) so that an interrupted recording remains playable and editable without manual repair.</p></li>
+    <li><span class="id">FR-3.5</span><p class="body">The user <strong>must</strong> be able to pause and resume a recording, and to abandon or keep a recording at the end of a session.</p></li>
+    <li><span class="id">FR-3.6</span><p class="body">The app <strong>must</strong> surface clear, actionable feedback when a recording cannot start because of a missing macOS permission (Screen Recording, Camera, or Microphone).</p></li>
+  </ol>
+  <div class="vnext"><strong>Multi-track</strong> recording (screen and webcam as independently editable streams) and <strong>picture-in-picture</strong> webcam overlay are explicit v-next goals. v1 records each enabled source but treats the recording as a single composited result for editing purposes.</div>
+
+  <h3 id="fr-workflow">4.4 Workflow Tagging</h3>
+  <ol class="reqs">
+    <li><span class="id">FR-4.1</span><p class="body">Each Video <strong>must</strong> carry exactly one workflow state at any time (e.g., <em>Needs Recording</em>, <em>Needs Editing</em>, <em>Needs Intro</em>, <em>Needs Uploading</em>).</p></li>
+    <li><span class="id">FR-4.2</span><p class="body">The set of workflow states <strong>must</strong> be defined by the user as a personal preference. The user <strong>must</strong> be able to add, rename, reorder, and remove states. The app ships with a sensible default set the user can replace.</p></li>
+    <li><span class="id">FR-4.3</span><p class="body">The user <strong>must</strong> be able to see all videos in a course grouped by workflow state (kanban-style board view) and move videos between states.</p></li>
+    <li><span class="id">FR-4.4</span><p class="body">Workflow transitions are <strong>manual only</strong> in v1. The app does not automatically advance a video's state based on recording or editing activity.</p></li>
+  </ol>
+  <div class="vnext">Automated workflow transitions (e.g., a Video that has been recorded automatically moves from <em>Needs Recording</em> to <em>Needs Editing</em>) may be revisited once real workflow patterns emerge.</div>
+
+  <h3 id="fr-transcript">4.5 Transcript-Based Editing</h3>
+  <ol class="reqs">
+    <li><span class="id">FR-5.1</span><p class="body">The app <strong>must</strong> automatically generate a transcript for each recorded Video, with word-level timestamps.</p></li>
+    <li><span class="id">FR-5.2</span><p class="body">The user <strong>must</strong> be able to view the transcript synchronised with the video, with the active word highlighted during playback.</p></li>
+    <li><span class="id">FR-5.3</span><p class="body">The user <strong>must</strong> be able to select text in the transcript and remove the corresponding audio and video. Selection granularity <strong>must</strong> support both <strong>individual words</strong> and <strong>whole sentences</strong> (e.g., a sentence-select convenience action).</p></li>
+    <li><span class="id">FR-5.4</span><p class="body">All transcript-driven edits <strong>must</strong> be <strong>non-destructive</strong>: the original recorded Segments are never modified. Edits are stored as a list of cut/keep decisions and applied at playback and at export time.</p></li>
+    <li><span class="id">FR-5.5</span><p class="body">The app <strong>must</strong> support unlimited undo and redo of transcript-driven edits within an editing session.</p></li>
+    <li><span class="id">FR-5.6</span><p class="body">Transcripts <strong>must</strong> be persisted alongside their Videos as part of the course folder, so they remain available for re-editing, search, and caption export without re-running transcription.</p></li>
+  </ol>
+
+  <h3 id="fr-effects">4.6 Effects &amp; Plugins</h3>
+  <ol class="reqs">
+    <li><span class="id">FR-6.1</span><p class="body">The app <strong>must</strong> ship a built-in library of video and audio effects covering common course-production needs. The exact set is scoped per-feature, but the intended coverage includes: <em>skin smoothing</em>, <em>cursor zoom and highlight</em>, <em>transitions between segments</em>, <em>lower-thirds and text overlays</em>, <em>color filters / look adjustments</em>, and <em>background music with ducking</em>.</p></li>
+    <li><span class="id">FR-6.2</span><p class="body">Effects <strong>must</strong> apply non-destructively as part of the Video's edit decision list and be re-orderable, adjustable, and removable.</p></li>
+    <li><span class="id">FR-6.3</span><p class="body">The effects architecture <strong>should</strong> be designed with future third-party plugin support in mind. v1 does not ship a public plugin API.</p></li>
+  </ol>
+  <div class="vnext">Third-party plugin support via an industry-standard host-agnostic video plugin format (target: an OpenFX-style standard, analogous to VST3 in audio) is an explicit v-next goal. v1 builds the in-app effect pipeline in a way that makes adopting such a standard later realistic.</div>
+
+  <h3 id="fr-export">4.7 Export</h3>
+  <ol class="reqs">
+    <li><span class="id">FR-7.1</span><p class="body">The user <strong>must</strong> be able to export each Video as a finished <strong>MP4</strong> file with all transcript-driven edits and effects applied.</p></li>
+    <li><span class="id">FR-7.2</span><p class="body">The user <strong>must</strong> be able to export the whole Course as a bundle: the MP4 files organised on disk by Module and Video order, plus a manifest (JSON and/or CSV) describing the course structure, titles, descriptions, and per-video metadata. This bundle is intended to make bulk upload to an LMS less painful.</p></li>
+    <li><span class="id">FR-7.3</span><p class="body">Each exported Video <strong>must</strong> have an accompanying <code>.srt</code> caption file derived from the (edited) transcript. The user <strong>should</strong> additionally be able to choose to burn captions into the video.</p></li>
+    <li><span class="id">FR-7.4</span><p class="body">The user <strong>must</strong> be able to preview an individual Video (with all edits and effects applied) inside the app before exporting it.</p></li>
+  </ol>
+  <div class="vnext">A whole-course preview / playthrough mode (watching the course end-to-end inside the app), and direct upload integrations to YouTube, Vimeo, Teachable, and similar destinations, are explicit v-next goals. SCORM, xAPI, and Common Cartridge LMS-export formats are out of scope unless a corporate-training audience becomes a stated target.</div>
+</section>
+
+<section id="non-functional">
+  <h2>5. Non-Functional Requirements</h2>
+  <ol class="reqs">
+    <li><span class="id">NFR-1</span><p class="body"><strong>Local-first.</strong> No Courseforge-operated server is required for any feature listed in §4. The app must function fully offline once installed (with the obvious exception that AI ideation calls reach the user's chosen AI provider over the internet).</p></li>
+    <li><span class="id">NFR-2</span><p class="body"><strong>Privacy.</strong> The app collects no telemetry, analytics, or usage data by default. The user's recordings, transcripts, prompts, and edits are never transmitted off-device except (a) to the AI provider the user has configured, when the user explicitly invokes an AI feature, and (b) to destinations the user explicitly chooses at export time.</p></li>
+    <li><span class="id">NFR-3</span><p class="body"><strong>No required account.</strong> The user can install the app and use every v1 feature without creating an account on any service. (They do need an AI provider account of their own to use AI ideation.)</p></li>
+    <li><span class="id">NFR-4</span><p class="body"><strong>Crash resilience for recordings.</strong> If the app or OS crashes during a recording, the captured-so-far audio and video must remain playable and importable into the originating Video slot when the app is reopened.</p></li>
+    <li><span class="id">NFR-5</span><p class="body"><strong>Crash resilience for edits.</strong> Transcript edits and effect adjustments must be persisted incrementally so that an unexpected exit does not lose more than the user's most recent action.</p></li>
+    <li><span class="id">NFR-6</span><p class="body"><strong>Portability.</strong> A course folder must be self-contained — no external references, no machine-specific absolute paths in the project files. Copying the folder to another Mac running Courseforge must reproduce the course faithfully.</p></li>
+    <li><span class="id">NFR-7</span><p class="body"><strong>Keyboard-driven editing.</strong> The editing UI must support standard video-editor keyboard transport (e.g., JKL for shuttle, spacebar for play/pause) and provide keyboard shortcuts for the common transcript-edit operations.</p></li>
+    <li><span class="id">NFR-8</span><p class="body"><strong>Performance.</strong> The app must remain responsive on a current-generation Apple Silicon Mac when working with a course of typical size (target: a multi-hour course composed of 30+ videos, each up to ~30 minutes long, recorded at 1080p). Specific latency and memory budgets are deferred to per-feature design.</p></li>
+    <li><span class="id">NFR-9</span><p class="body"><strong>macOS permissions.</strong> All required macOS permissions (Screen Recording, Camera, Microphone, file access) must be requested at the point of use with clear in-app messaging explaining why they are needed.</p></li>
+    <li><span class="id">NFR-10</span><p class="body"><strong>Accessibility.</strong> The UI should follow macOS accessibility conventions (VoiceOver labels on controls, sufficient contrast, full keyboard navigability of non-timeline UI). Detailed accessibility requirements are deferred to per-feature design.</p></li>
+  </ol>
+</section>
+
+<section id="out-of-scope">
+  <h2>6. Out of Scope (v1)</h2>
+  <p>To keep v1 focused, the following are <em>explicitly</em> not included. Each is either deferred to v-next (see §7) or out of scope entirely.</p>
+  <ul>
+    <li>Hosting, streaming, or serving courses to students.</li>
+    <li>Student authentication, enrollment, progress tracking, certificates, payments, or any other LMS functionality.</li>
+    <li>Windows, Linux, iOS, iPadOS, or web/browser versions of the app.</li>
+    <li>Real-time collaboration or multi-user editing.</li>
+    <li>Server-side AI services operated by Courseforge.</li>
+    <li>SCORM, xAPI, Common Cartridge, or other corporate-LMS export formats.</li>
+    <li>Hierarchical course structures beyond Course → Module → Video.</li>
+  </ul>
+</section>
+
+<section id="vnext">
+  <h2>7. v-next Roadmap</h2>
+  <p>The following are named, deferred goals. They influence v1 architecture decisions (so that adopting them later is realistic) but are not v1 requirements.</p>
+  <ul>
+    <li><strong>Multi-track recording</strong> — screen and webcam captured as independently editable streams.</li>
+    <li><strong>Picture-in-picture</strong> webcam overlay with repositioning and resizing at edit time.</li>
+    <li><strong>Persistent AI chat per course</strong> — an ongoing conversation that can read and modify the course skeleton.</li>
+    <li><strong>Multi-provider AI</strong> — OpenAI, Gemini, local models, in addition to Anthropic.</li>
+    <li><strong>Third-party effect plugins</strong> via an industry-standard host-agnostic format (target: OpenFX-style).</li>
+    <li><strong>Direct upload integrations</strong> — YouTube, Vimeo, Teachable, Thinkific, and similar destinations.</li>
+    <li><strong>Full-course preview</strong> — end-to-end playback inside the app before export.</li>
+    <li><strong>Automated workflow transitions</strong> based on recording / editing activity.</li>
+    <li><strong>Sub-modules or deeper hierarchy</strong>, if real usage patterns demand them.</li>
+  </ul>
+</section>
+
+<section id="glossary">
+  <h2>8. Glossary</h2>
+  <dl class="glossary">
+    <dt>Course</dt>
+    <dd>The top-level unit of work. An ordered collection of Modules, persisted as a self-contained folder on disk.</dd>
+
+    <dt>Module</dt>
+    <dd>A named, ordered grouping of Videos within a Course (e.g., "Introduction", "Mechanics", "Theory").</dd>
+
+    <dt>Video</dt>
+    <dd>The exportable unit. A timeline composed of one or more recorded Segments plus non-destructive edit and effect decisions.</dd>
+
+    <dt>Segment</dt>
+    <dd>A single contiguous recording. A Video contains one or more Segments arranged in order.</dd>
+
+    <dt>Workflow state</dt>
+    <dd>A user-defined label indicating where a Video is in the creator's personal production process (e.g., <em>Needs Recording</em>, <em>Needs Editing</em>).</dd>
+
+    <dt>Transcript</dt>
+    <dd>An automatically generated text representation of a Video's spoken content, with word-level timestamps. Persisted with the Video.</dd>
+
+    <dt>Transcript-based editing</dt>
+    <dd>Modifying the Video by editing its transcript: selecting words or sentences and removing them, which removes the corresponding audio and video.</dd>
+
+    <dt>Non-destructive editing</dt>
+    <dd>Editing in which the original recorded files are never modified. Edits are stored as decisions and applied at playback and at export.</dd>
+
+    <dt>Effect</dt>
+    <dd>A non-destructive visual or audio transformation applied to a Video (e.g., skin smoothing, cursor zoom, lower-third, music ducking).</dd>
+
+    <dt>BYOK</dt>
+    <dd>Bring-your-own-key. The user supplies their own AI provider API credentials; Courseforge never proxies or charges for AI usage.</dd>
+
+    <dt>MKV</dt>
+    <dd>Matroska container format. Chosen for in-progress recordings because it remains playable and recoverable when writing is interrupted, unlike MP4.</dd>
+
+    <dt>MP4</dt>
+    <dd>The export container format. Used because it is the universally accepted format for downstream platforms (YouTube, LMSs, etc.).</dd>
+
+    <dt>v-next</dt>
+    <dd>Shorthand for "after v1." Used to mark named goals that are deferred but considered in v1's architecture.</dd>
+  </dl>
+</section>
+
+</main>
+
+</div>
+</body>
+</html>

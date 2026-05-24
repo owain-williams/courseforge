@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default capabilities for Courseforge",
-  "windows": ["main"],
+  "windows": ["main", "course-*"],
   "permissions": [
     "core:default",
     "dialog:default",

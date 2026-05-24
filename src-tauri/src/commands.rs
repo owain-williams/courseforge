@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 use serde::Serialize;
-use tauri::Manager;
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use crate::core::{config, course, library, CoreError};
+use crate::windows::{CourseWindowRegistry, OpenDecision};
 
 #[derive(Debug, Serialize)]
 pub struct AppError {
@@ -58,4 +59,117 @@ pub fn scan_library(root: PathBuf) -> Result<Vec<library::CourseEntry>, AppError
 #[tauri::command]
 pub fn rename_course(folder: PathBuf, new_title: String) -> Result<PathBuf, AppError> {
     Ok(course::rename_course(&folder, &new_title)?)
+}
+
+#[tauri::command]
+pub fn read_course(folder: PathBuf) -> Result<course::Course, AppError> {
+    Ok(course::read_course(&folder)?)
+}
+
+#[tauri::command]
+pub fn add_module(folder: PathBuf, title: String) -> Result<course::Module, AppError> {
+    Ok(course::add_module(&folder, &title)?)
+}
+
+#[tauri::command]
+pub fn rename_module(folder: PathBuf, module_id: String, new_title: String) -> Result<(), AppError> {
+    Ok(course::rename_module(&folder, &module_id, &new_title)?)
+}
+
+#[tauri::command]
+pub fn reorder_modules(folder: PathBuf, ordered_ids: Vec<String>) -> Result<(), AppError> {
+    Ok(course::reorder_modules(&folder, &ordered_ids)?)
+}
+
+#[tauri::command]
+pub fn delete_module(folder: PathBuf, module_id: String) -> Result<(), AppError> {
+    Ok(course::delete_module(&folder, &module_id)?)
+}
+
+#[tauri::command]
+pub fn add_video(folder: PathBuf, module_id: String, title: String) -> Result<course::Video, AppError> {
+    Ok(course::add_video(&folder, &module_id, &title)?)
+}
+
+#[tauri::command]
+pub fn rename_video(folder: PathBuf, video_id: String, new_title: String) -> Result<(), AppError> {
+    Ok(course::rename_video(&folder, &video_id, &new_title)?)
+}
+
+#[tauri::command]
+pub fn reorder_videos_in_module(
+    folder: PathBuf,
+    module_id: String,
+    ordered_ids: Vec<String>,
+) -> Result<(), AppError> {
+    Ok(course::reorder_videos_in_module(&folder, &module_id, &ordered_ids)?)
+}
+
+#[tauri::command]
+pub fn delete_video(folder: PathBuf, video_id: String) -> Result<(), AppError> {
+    Ok(course::delete_video(&folder, &video_id)?)
+}
+
+#[tauri::command]
+pub fn move_video_to_module(
+    folder: PathBuf,
+    video_id: String,
+    target_module_id: String,
+    index: usize,
+) -> Result<(), AppError> {
+    Ok(course::move_video_to_module(
+        &folder,
+        &video_id,
+        &target_module_id,
+        index,
+    )?)
+}
+
+#[tauri::command]
+pub fn open_course_window(
+    app: tauri::AppHandle,
+    registry: tauri::State<'_, CourseWindowRegistry>,
+    folder: PathBuf,
+) -> Result<(), AppError> {
+    // Read the course up front so we can surface "not a course folder" as a
+    // user-visible error, and to put the title in the window chrome.
+    let course = course::read_course(&folder)?;
+
+    let decision = registry.open_or_focus(&folder);
+    match decision {
+        OpenDecision::Focus { label } => {
+            if let Some(win) = app.get_webview_window(&label) {
+                let _ = win.set_focus();
+            }
+            Ok(())
+        }
+        OpenDecision::Spawn { label } => {
+            let win = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("course/".into()))
+                .title(format!("{} — Courseforge", course.title))
+                .inner_size(1000.0, 720.0)
+                .min_inner_size(700.0, 480.0)
+                .build()
+                .map_err(|e| AppError { message: format!("failed to open course window: {e}") })?;
+
+            // Release the slot on close so the user can re-open the same Course.
+            let app_handle = app.clone();
+            let folder_for_close = folder.clone();
+            win.on_window_event(move |event| {
+                if let tauri::WindowEvent::Destroyed = event {
+                    if let Some(reg) = app_handle.try_state::<CourseWindowRegistry>() {
+                        reg.release(&folder_for_close);
+                    }
+                }
+            });
+            Ok(())
+        }
+    }
+}
+
+#[tauri::command]
+pub fn get_window_course_folder(
+    window: tauri::Window,
+    registry: tauri::State<'_, CourseWindowRegistry>,
+) -> Option<PathBuf> {
+    registry.folder_for_label(window.label())
 }

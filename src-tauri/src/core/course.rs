@@ -6,13 +6,31 @@ use crate::core::slug;
 pub const COURSE_JSON: &str = "course.json";
 pub const SCHEMA_VERSION: u32 = 1;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Module {
+    pub id: String,
+    pub title: String,
+    #[serde(rename = "videoIds", default)]
+    pub video_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Video {
+    pub id: String,
+    pub title: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Course {
     #[serde(rename = "schemaVersion")]
     pub schema_version: u32,
     pub title: String,
-    pub modules: Vec<serde_json::Value>,
-    pub videos: Vec<serde_json::Value>,
+    pub modules: Vec<Module>,
+    pub videos: Vec<Video>,
+}
+
+fn new_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 impl Course {
@@ -51,7 +69,203 @@ fn write_course(folder: &Path, course: &Course) -> Result<()> {
         path: path.clone(),
         source: e,
     })?;
-    std::fs::write(&path, json).map_err(|e| CoreError::Io { path, source: e })
+    write_atomic(&path, json.as_bytes())
+}
+
+/// Atomic write: serialise to a sibling `.tmp` file, fsync, then rename
+/// over the destination. A crash mid-write leaves either the previous file
+/// intact or the new one fully written — never a half-written `course.json`.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp).map_err(|e| CoreError::Io {
+            path: tmp.clone(),
+            source: e,
+        })?;
+        f.write_all(bytes).map_err(|e| CoreError::Io {
+            path: tmp.clone(),
+            source: e,
+        })?;
+        f.sync_all().map_err(|e| CoreError::Io {
+            path: tmp.clone(),
+            source: e,
+        })?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| CoreError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })
+}
+
+fn mutate_course<F>(folder: &Path, f: F) -> Result<Course>
+where
+    F: FnOnce(&mut Course) -> Result<()>,
+{
+    let mut course = read_course(folder)?;
+    f(&mut course)?;
+    write_course(folder, &course)?;
+    Ok(course)
+}
+
+pub fn add_module(folder: &Path, title: &str) -> Result<Module> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(CoreError::EmptyTitle);
+    }
+    let module = Module {
+        id: new_id(),
+        title: title.to_string(),
+        video_ids: Vec::new(),
+    };
+    let added = module.clone();
+    mutate_course(folder, |c| {
+        c.modules.push(module);
+        Ok(())
+    })?;
+    Ok(added)
+}
+
+pub fn rename_video(folder: &Path, video_id: &str, new_title: &str) -> Result<()> {
+    let title = new_title.trim();
+    if title.is_empty() {
+        return Err(CoreError::EmptyTitle);
+    }
+    mutate_course(folder, |c| {
+        let v = c.videos.iter_mut()
+            .find(|v| v.id == video_id)
+            .ok_or_else(|| CoreError::VideoNotFound(video_id.to_string()))?;
+        v.title = title.to_string();
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub fn reorder_videos_in_module(folder: &Path, module_id: &str, ordered_ids: &[String]) -> Result<()> {
+    mutate_course(folder, |c| {
+        let m = c.modules.iter_mut()
+            .find(|m| m.id == module_id)
+            .ok_or_else(|| CoreError::ModuleNotFound(module_id.to_string()))?;
+        if !same_set(ordered_ids, m.video_ids.iter().map(String::as_str)) {
+            return Err(CoreError::ReorderMismatch);
+        }
+        m.video_ids = ordered_ids.to_vec();
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub fn delete_video(folder: &Path, video_id: &str) -> Result<()> {
+    mutate_course(folder, |c| {
+        let idx = c.videos.iter()
+            .position(|v| v.id == video_id)
+            .ok_or_else(|| CoreError::VideoNotFound(video_id.to_string()))?;
+        c.videos.remove(idx);
+        for m in &mut c.modules {
+            m.video_ids.retain(|id| id != video_id);
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Move a Video to (a possibly different) Module at the given insertion index.
+/// This is a `course.json` array edit only — the on-disk `videos/<video-id>/`
+/// folder, if any, is untouched (ADR-0001).
+pub fn move_video_to_module(
+    folder: &Path,
+    video_id: &str,
+    target_module_id: &str,
+    index: usize,
+) -> Result<()> {
+    mutate_course(folder, |c| {
+        if !c.videos.iter().any(|v| v.id == video_id) {
+            return Err(CoreError::VideoNotFound(video_id.to_string()));
+        }
+        if !c.modules.iter().any(|m| m.id == target_module_id) {
+            return Err(CoreError::ModuleNotFound(target_module_id.to_string()));
+        }
+        for m in &mut c.modules {
+            m.video_ids.retain(|id| id != video_id);
+        }
+        let target = c.modules.iter_mut().find(|m| m.id == target_module_id).unwrap();
+        let insert_at = index.min(target.video_ids.len());
+        target.video_ids.insert(insert_at, video_id.to_string());
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub fn delete_module(folder: &Path, module_id: &str) -> Result<()> {
+    mutate_course(folder, |c| {
+        let idx = c.modules.iter()
+            .position(|m| m.id == module_id)
+            .ok_or_else(|| CoreError::ModuleNotFound(module_id.to_string()))?;
+        let removed = c.modules.remove(idx);
+        let doomed: std::collections::HashSet<&str> =
+            removed.video_ids.iter().map(String::as_str).collect();
+        c.videos.retain(|v| !doomed.contains(v.id.as_str()));
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub fn add_video(folder: &Path, module_id: &str, title: &str) -> Result<Video> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(CoreError::EmptyTitle);
+    }
+    let video = Video { id: new_id(), title: title.to_string() };
+    let added = video.clone();
+    mutate_course(folder, |c| {
+        let m = c.modules.iter_mut()
+            .find(|m| m.id == module_id)
+            .ok_or_else(|| CoreError::ModuleNotFound(module_id.to_string()))?;
+        m.video_ids.push(video.id.clone());
+        c.videos.push(video);
+        Ok(())
+    })?;
+    Ok(added)
+}
+
+pub fn reorder_modules(folder: &Path, ordered_ids: &[String]) -> Result<()> {
+    mutate_course(folder, |c| {
+        if !same_set(ordered_ids, c.modules.iter().map(|m| m.id.as_str())) {
+            return Err(CoreError::ReorderMismatch);
+        }
+        c.modules.sort_by_key(|m| {
+            ordered_ids.iter().position(|id| id == &m.id).unwrap()
+        });
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn same_set<'a, I>(ordered: &[String], existing: I) -> bool
+where
+    I: Iterator<Item = &'a str>,
+{
+    let existing: std::collections::HashSet<&str> = existing.collect();
+    if ordered.len() != existing.len() {
+        return false;
+    }
+    let proposed: std::collections::HashSet<&str> = ordered.iter().map(String::as_str).collect();
+    proposed == existing
+}
+
+pub fn rename_module(folder: &Path, module_id: &str, new_title: &str) -> Result<()> {
+    let title = new_title.trim();
+    if title.is_empty() {
+        return Err(CoreError::EmptyTitle);
+    }
+    mutate_course(folder, |c| {
+        let m = c.modules.iter_mut()
+            .find(|m| m.id == module_id)
+            .ok_or_else(|| CoreError::ModuleNotFound(module_id.to_string()))?;
+        m.title = title.to_string();
+        Ok(())
+    })?;
+    Ok(())
 }
 
 pub fn read_course(folder: &Path) -> Result<Course> {
@@ -193,5 +407,333 @@ mod tests {
         assert_eq!(parsed["title"], "Hello World");
         assert_eq!(parsed["modules"], serde_json::json!([]));
         assert_eq!(parsed["videos"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn add_module_appends_a_module_with_fresh_id_and_persists() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+
+        let m = add_module(&folder, "Intro").unwrap();
+        assert!(!m.id.is_empty());
+        assert_eq!(m.title, "Intro");
+        assert!(m.video_ids.is_empty());
+
+        let on_disk = read_course(&folder).unwrap();
+        assert_eq!(on_disk.modules.len(), 1);
+        assert_eq!(on_disk.modules[0], m);
+    }
+
+    #[test]
+    fn add_module_assigns_distinct_ids_to_successive_modules() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let a = add_module(&folder, "A").unwrap();
+        let b = add_module(&folder, "B").unwrap();
+        assert_ne!(a.id, b.id);
+
+        let on_disk = read_course(&folder).unwrap();
+        assert_eq!(on_disk.modules.iter().map(|m| &m.title).collect::<Vec<_>>(),
+                   vec!["A", "B"]);
+    }
+
+    #[test]
+    fn add_module_rejects_empty_title() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        assert!(matches!(add_module(&folder, "  "), Err(CoreError::EmptyTitle)));
+    }
+
+    #[test]
+    fn rename_module_updates_title_in_place() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "Old").unwrap();
+
+        rename_module(&folder, &m.id, "New").unwrap();
+
+        let on_disk = read_course(&folder).unwrap();
+        assert_eq!(on_disk.modules[0].id, m.id);
+        assert_eq!(on_disk.modules[0].title, "New");
+    }
+
+    #[test]
+    fn rename_module_rejects_empty_title() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "Old").unwrap();
+        assert!(matches!(rename_module(&folder, &m.id, " "), Err(CoreError::EmptyTitle)));
+    }
+
+    #[test]
+    fn rename_module_errors_when_module_not_found() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let result = rename_module(&folder, "no-such-id", "X");
+        assert!(matches!(result, Err(CoreError::ModuleNotFound(_))));
+    }
+
+    #[test]
+    fn reorder_modules_permutes_the_module_list() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let a = add_module(&folder, "A").unwrap();
+        let b = add_module(&folder, "B").unwrap();
+        let c = add_module(&folder, "C").unwrap();
+
+        reorder_modules(&folder, &[c.id.clone(), a.id.clone(), b.id.clone()]).unwrap();
+
+        let on_disk = read_course(&folder).unwrap();
+        let titles: Vec<_> = on_disk.modules.iter().map(|m| m.title.as_str()).collect();
+        assert_eq!(titles, vec!["C", "A", "B"]);
+    }
+
+    #[test]
+    fn reorder_modules_rejects_mismatched_id_set() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let a = add_module(&folder, "A").unwrap();
+        add_module(&folder, "B").unwrap();
+
+        // Missing one of the existing ids — should reject and not mutate.
+        let result = reorder_modules(&folder, &[a.id.clone()]);
+        assert!(matches!(result, Err(CoreError::ReorderMismatch)));
+        assert_eq!(read_course(&folder).unwrap().modules.len(), 2);
+    }
+
+    #[test]
+    fn add_video_appends_video_and_registers_it_with_module() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "M").unwrap();
+
+        let v = add_video(&folder, &m.id, "Intro slot").unwrap();
+        assert!(!v.id.is_empty());
+        assert_eq!(v.title, "Intro slot");
+
+        let on_disk = read_course(&folder).unwrap();
+        assert_eq!(on_disk.videos, vec![v.clone()]);
+        assert_eq!(on_disk.modules[0].video_ids, vec![v.id]);
+    }
+
+    #[test]
+    fn add_video_appends_to_target_module_order() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "M").unwrap();
+        let a = add_video(&folder, &m.id, "A").unwrap();
+        let b = add_video(&folder, &m.id, "B").unwrap();
+
+        let on_disk = read_course(&folder).unwrap();
+        assert_eq!(on_disk.modules[0].video_ids, vec![a.id, b.id]);
+    }
+
+    #[test]
+    fn add_video_rejects_empty_title() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "M").unwrap();
+        assert!(matches!(add_video(&folder, &m.id, "  "), Err(CoreError::EmptyTitle)));
+    }
+
+    #[test]
+    fn add_video_errors_when_module_not_found() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let result = add_video(&folder, "no-such-id", "A");
+        assert!(matches!(result, Err(CoreError::ModuleNotFound(_))));
+    }
+
+    #[test]
+    fn delete_module_removes_it_and_cascades_to_its_videos() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let keep = add_module(&folder, "Keep").unwrap();
+        let drop = add_module(&folder, "Drop").unwrap();
+        let v_kept = add_video(&folder, &keep.id, "K").unwrap();
+        let v_gone = add_video(&folder, &drop.id, "G").unwrap();
+
+        delete_module(&folder, &drop.id).unwrap();
+
+        let on_disk = read_course(&folder).unwrap();
+        assert_eq!(on_disk.modules.iter().map(|m| &m.id).collect::<Vec<_>>(), vec![&keep.id]);
+        let video_ids: Vec<_> = on_disk.videos.iter().map(|v| v.id.clone()).collect();
+        assert_eq!(video_ids, vec![v_kept.id]);
+        assert!(!video_ids.contains(&v_gone.id));
+    }
+
+    #[test]
+    fn delete_module_errors_when_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        assert!(matches!(delete_module(&folder, "no-such-id"), Err(CoreError::ModuleNotFound(_))));
+    }
+
+    #[test]
+    fn rename_video_updates_title_in_place() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "M").unwrap();
+        let v = add_video(&folder, &m.id, "Old").unwrap();
+
+        rename_video(&folder, &v.id, "New").unwrap();
+        let on_disk = read_course(&folder).unwrap();
+        assert_eq!(on_disk.videos[0].id, v.id);
+        assert_eq!(on_disk.videos[0].title, "New");
+    }
+
+    #[test]
+    fn rename_video_rejects_empty_title() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "M").unwrap();
+        let v = add_video(&folder, &m.id, "Old").unwrap();
+        assert!(matches!(rename_video(&folder, &v.id, " "), Err(CoreError::EmptyTitle)));
+    }
+
+    #[test]
+    fn rename_video_errors_when_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        assert!(matches!(rename_video(&folder, "no-such-id", "X"), Err(CoreError::VideoNotFound(_))));
+    }
+
+    #[test]
+    fn reorder_videos_in_module_permutes_only_that_modules_order() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m1 = add_module(&folder, "M1").unwrap();
+        let m2 = add_module(&folder, "M2").unwrap();
+        let a = add_video(&folder, &m1.id, "A").unwrap();
+        let b = add_video(&folder, &m1.id, "B").unwrap();
+        let c = add_video(&folder, &m1.id, "C").unwrap();
+        let z = add_video(&folder, &m2.id, "Z").unwrap();
+
+        reorder_videos_in_module(&folder, &m1.id, &[c.id.clone(), a.id.clone(), b.id.clone()])
+            .unwrap();
+
+        let on_disk = read_course(&folder).unwrap();
+        let m1_after = on_disk.modules.iter().find(|m| m.id == m1.id).unwrap();
+        let m2_after = on_disk.modules.iter().find(|m| m.id == m2.id).unwrap();
+        assert_eq!(m1_after.video_ids, vec![c.id, a.id, b.id]);
+        assert_eq!(m2_after.video_ids, vec![z.id]);
+    }
+
+    #[test]
+    fn reorder_videos_in_module_rejects_mismatched_id_set() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "M").unwrap();
+        let a = add_video(&folder, &m.id, "A").unwrap();
+        add_video(&folder, &m.id, "B").unwrap();
+
+        let result = reorder_videos_in_module(&folder, &m.id, &[a.id]);
+        assert!(matches!(result, Err(CoreError::ReorderMismatch)));
+    }
+
+    #[test]
+    fn delete_video_removes_from_videos_and_its_module() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "M").unwrap();
+        let a = add_video(&folder, &m.id, "A").unwrap();
+        let b = add_video(&folder, &m.id, "B").unwrap();
+
+        delete_video(&folder, &a.id).unwrap();
+        let on_disk = read_course(&folder).unwrap();
+        assert_eq!(on_disk.videos.iter().map(|v| v.id.clone()).collect::<Vec<_>>(), vec![b.id.clone()]);
+        assert_eq!(on_disk.modules[0].video_ids, vec![b.id]);
+    }
+
+    #[test]
+    fn delete_video_errors_when_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        assert!(matches!(delete_video(&folder, "no-such-id"), Err(CoreError::VideoNotFound(_))));
+    }
+
+    #[test]
+    fn move_video_to_module_relocates_id_without_touching_videos_array_order() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let src = add_module(&folder, "Src").unwrap();
+        let dst = add_module(&folder, "Dst").unwrap();
+        let a = add_video(&folder, &src.id, "A").unwrap();
+        let b = add_video(&folder, &src.id, "B").unwrap();
+        let x = add_video(&folder, &dst.id, "X").unwrap();
+
+        move_video_to_module(&folder, &a.id, &dst.id, 1).unwrap();
+
+        let on_disk = read_course(&folder).unwrap();
+        let src_after = on_disk.modules.iter().find(|m| m.id == src.id).unwrap();
+        let dst_after = on_disk.modules.iter().find(|m| m.id == dst.id).unwrap();
+        assert_eq!(src_after.video_ids, vec![b.id]);
+        assert_eq!(dst_after.video_ids, vec![x.id, a.id]);
+
+        // The top-level videos[] array stays as-is; Video {a} still exists with its id.
+        let video_ids: std::collections::HashSet<_> =
+            on_disk.videos.iter().map(|v| v.id.clone()).collect();
+        assert_eq!(video_ids.len(), 3);
+    }
+
+    #[test]
+    fn move_video_to_module_clamps_index_to_end_of_target() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let src = add_module(&folder, "Src").unwrap();
+        let dst = add_module(&folder, "Dst").unwrap();
+        let a = add_video(&folder, &src.id, "A").unwrap();
+        let x = add_video(&folder, &dst.id, "X").unwrap();
+
+        // index way past the end -> append.
+        move_video_to_module(&folder, &a.id, &dst.id, 999).unwrap();
+        let on_disk = read_course(&folder).unwrap();
+        let dst_after = on_disk.modules.iter().find(|m| m.id == dst.id).unwrap();
+        assert_eq!(dst_after.video_ids, vec![x.id, a.id]);
+    }
+
+    #[test]
+    fn move_video_to_module_within_same_module_reorders() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "M").unwrap();
+        let a = add_video(&folder, &m.id, "A").unwrap();
+        let b = add_video(&folder, &m.id, "B").unwrap();
+        let c = add_video(&folder, &m.id, "C").unwrap();
+
+        // move A to the end.
+        move_video_to_module(&folder, &a.id, &m.id, 2).unwrap();
+        let on_disk = read_course(&folder).unwrap();
+        assert_eq!(on_disk.modules[0].video_ids, vec![b.id, c.id, a.id]);
+    }
+
+    #[test]
+    fn move_video_to_module_errors_for_missing_video_or_module() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "M").unwrap();
+        let v = add_video(&folder, &m.id, "V").unwrap();
+
+        assert!(matches!(
+            move_video_to_module(&folder, "nope", &m.id, 0),
+            Err(CoreError::VideoNotFound(_))
+        ));
+        assert!(matches!(
+            move_video_to_module(&folder, &v.id, "nope", 0),
+            Err(CoreError::ModuleNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn write_course_leaves_no_temp_file_behind() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        add_module(&folder, "A").unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(&folder).unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(entries.iter().any(|n| n == COURSE_JSON));
+        assert!(!entries.iter().any(|n| n.to_string_lossy().ends_with(".tmp")));
     }
 }

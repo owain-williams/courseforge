@@ -56,6 +56,64 @@ pub fn scan_library(root: PathBuf) -> Result<Vec<library::CourseEntry>, AppError
     Ok(library::scan_library(&root)?)
 }
 
+/// Build the merged Library view: Scanned-Root entries + Pinned Folders,
+/// minus Ignored Folders. Reads the user's saved config so callers don't
+/// have to pass it in.
+#[tauri::command]
+pub fn list_library(app: tauri::AppHandle) -> Result<Vec<library::CourseEntry>, AppError> {
+    let cfg = config::read_config(&config_path(&app)?)?;
+    Ok(library::library_view(&cfg)?)
+}
+
+/// "Add Existing Course…" — validate the folder is a Course Folder, pin it,
+/// persist. Returns the updated config so the caller can reflect the new
+/// pin set without an extra round trip.
+#[tauri::command]
+pub fn add_existing_course(
+    app: tauri::AppHandle,
+    folder: PathBuf,
+) -> Result<config::AppConfig, AppError> {
+    let path = config_path(&app)?;
+    let mut cfg = config::read_config(&path)?;
+    library::pin_folder(&mut cfg, &folder)?;
+    config::write_config(&path, &cfg)?;
+    Ok(cfg)
+}
+
+/// "Remove from Library" — for a Pinned Folder, unpin. For a Scanned-Root
+/// entry, add to the ignored list so the next scan skips it. The folder on
+/// disk is untouched (ADR-0001).
+#[tauri::command]
+pub fn remove_from_library(
+    app: tauri::AppHandle,
+    folder: PathBuf,
+) -> Result<config::AppConfig, AppError> {
+    let path = config_path(&app)?;
+    let mut cfg = config::read_config(&path)?;
+    let was_pinned = library::unpin_folder(&mut cfg, &folder);
+    if !was_pinned {
+        library::ignore_folder(&mut cfg, &folder);
+    }
+    config::write_config(&path, &cfg)?;
+    Ok(cfg)
+}
+
+/// "Move to Trash" — send the Course Folder to the macOS Trash and tidy up
+/// any pin/ignore entries that referenced it.
+#[tauri::command]
+pub fn move_course_to_trash(
+    app: tauri::AppHandle,
+    folder: PathBuf,
+) -> Result<config::AppConfig, AppError> {
+    let path = config_path(&app)?;
+    let mut cfg = config::read_config(&path)?;
+    library::move_course_folder_to_trash(&folder)?;
+    library::unpin_folder(&mut cfg, &folder);
+    library::unignore_folder(&mut cfg, &folder);
+    config::write_config(&path, &cfg)?;
+    Ok(cfg)
+}
+
 #[tauri::command]
 pub fn rename_course(folder: PathBuf, new_title: String) -> Result<PathBuf, AppError> {
     Ok(course::rename_course(&folder, &new_title)?)

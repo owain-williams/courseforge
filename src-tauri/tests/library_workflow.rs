@@ -18,6 +18,7 @@ fn create_then_scan_then_restart_sees_the_same_courses() {
         &config_path,
         &AppConfig {
             scanned_root: Some(scanned_root.path().to_path_buf()),
+            ..Default::default()
         },
     )
     .unwrap();

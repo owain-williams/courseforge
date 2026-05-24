@@ -8,6 +8,15 @@ pub const CONFIG_FILENAME: &str = "config.json";
 pub struct AppConfig {
     #[serde(rename = "scannedRoot")]
     pub scanned_root: Option<PathBuf>,
+    /// Course Folders living outside the Scanned Root that the user has
+    /// explicitly added to the Library via "Add Existing Course…" (ADR-0001).
+    #[serde(rename = "pinnedFolders", default)]
+    pub pinned_folders: Vec<PathBuf>,
+    /// Course Folders living inside the Scanned Root that the user has
+    /// explicitly forgotten via "Remove from Library (keep bytes)". They are
+    /// filtered out of the scan; the bytes on disk are untouched (ADR-0001).
+    #[serde(rename = "ignoredFolders", default)]
+    pub ignored_folders: Vec<PathBuf>,
 }
 
 pub fn read_config(config_path: &Path) -> Result<AppConfig> {
@@ -62,10 +71,39 @@ mod tests {
         let path = dir.path().join("config.json");
         let original = AppConfig {
             scanned_root: Some(PathBuf::from("/Users/me/Courseforge")),
+            pinned_folders: Vec::new(),
+            ignored_folders: Vec::new(),
         };
         write_config(&path, &original).unwrap();
         let loaded = read_config(&path).unwrap();
         assert_eq!(loaded, original);
+    }
+
+    #[test]
+    fn write_then_read_config_round_trips_pinned_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let original = AppConfig {
+            scanned_root: Some(PathBuf::from("/Users/me/Courseforge")),
+            pinned_folders: vec![
+                PathBuf::from("/Users/me/Elsewhere/Course One"),
+                PathBuf::from("/Volumes/External/Course Two"),
+            ],
+            ignored_folders: vec![PathBuf::from("/Users/me/Courseforge/forgotten")],
+        };
+        write_config(&path, &original).unwrap();
+        let loaded = read_config(&path).unwrap();
+        assert_eq!(loaded, original);
+    }
+
+    #[test]
+    fn read_config_treats_missing_optional_fields_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"scannedRoot":"/Users/me/Courseforge"}"#).unwrap();
+        let cfg = read_config(&path).unwrap();
+        assert!(cfg.pinned_folders.is_empty());
+        assert!(cfg.ignored_folders.is_empty());
     }
 
     #[test]

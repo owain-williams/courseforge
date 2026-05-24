@@ -31,6 +31,9 @@ pub enum CoreError {
 
     #[error("reorder list does not match existing items")]
     ReorderMismatch,
+
+    #[error("failed to move {path} to Trash: {message}")]
+    Trash { path: PathBuf, message: String },
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

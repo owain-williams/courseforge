@@ -6,10 +6,14 @@
     setScannedRoot,
     defaultScannedRoot,
     createCourse,
-    scanLibrary,
+    listLibrary,
     renameCourse,
     openCourseWindow,
     pickDirectory,
+    pickExistingCourseFolder,
+    addExistingCourse,
+    removeFromLibrary,
+    moveCourseToTrash,
     type CourseEntry
   } from '$lib/api';
 
@@ -24,6 +28,7 @@
   let newCourseOpen = $state(false);
   let newCourseDraft = $state('');
   let newCourseInputEl = $state<HTMLInputElement | null>(null);
+  let confirmingFolder = $state<string | null>(null);
 
   $effect(() => {
     if (renamingFolder && renameInputEl) {
@@ -40,9 +45,8 @@
   });
 
   async function refresh() {
-    if (!scannedRoot) return;
     try {
-      entries = await scanLibrary(scannedRoot);
+      entries = await listLibrary();
     } catch (e) {
       error = String(e);
     }
@@ -58,6 +62,21 @@
       await refresh();
     } catch (e) {
       error = String(e);
+    }
+  }
+
+  async function addExisting() {
+    error = null;
+    const picked = await pickExistingCourseFolder();
+    if (!picked) return;
+    busy = true;
+    try {
+      await addExistingCourse(picked);
+      await refresh();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      busy = false;
     }
   }
 
@@ -98,6 +117,7 @@
   }
 
   async function openCourse(entry: CourseEntry) {
+    if (entry.missing) return;
     error = null;
     try {
       await openCourseWindow(entry.folder);
@@ -125,6 +145,47 @@
     }
   }
 
+  async function unpinPinned(entry: CourseEntry) {
+    busy = true;
+    error = null;
+    try {
+      await removeFromLibrary(entry.folder);
+      await refresh();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function confirmRemoveKeepBytes(entry: CourseEntry) {
+    busy = true;
+    error = null;
+    try {
+      await removeFromLibrary(entry.folder);
+      confirmingFolder = null;
+      await refresh();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function confirmMoveToTrash(entry: CourseEntry) {
+    busy = true;
+    error = null;
+    try {
+      await moveCourseToTrash(entry.folder);
+      confirmingFolder = null;
+      await refresh();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
   function fmtDate(ms: number) {
     if (!ms) return '';
     return new Date(ms).toLocaleString();
@@ -138,7 +199,7 @@
         const [cfg, fallback] = await Promise.all([getConfig(), defaultScannedRoot()]);
         suggestedDefault = fallback;
         scannedRoot = cfg.scannedRoot;
-        if (scannedRoot) await refresh();
+        await refresh();
       } catch (e) {
         error = String(e);
       }
@@ -209,9 +270,14 @@
           </button>
         </form>
       {:else}
-        <button class="primary" onclick={openNewCourse} disabled={busy}>
-          + New Course
-        </button>
+        <div class="toolbar-buttons">
+          <button class="primary" onclick={openNewCourse} disabled={busy}>
+            + New Course
+          </button>
+          <button class="ghost" onclick={addExisting} disabled={busy}>
+            Add Existing Course…
+          </button>
+        </div>
       {/if}
     </section>
 
@@ -231,7 +297,7 @@
         </thead>
         <tbody>
           {#each entries as entry (entry.folder)}
-            <tr>
+            <tr class:missing={entry.missing}>
               <td>
                 {#if renamingFolder === entry.folder}
                   <input
@@ -243,6 +309,11 @@
                       else if (e.key === 'Escape') renamingFolder = null;
                     }}
                   />
+                {:else if entry.missing}
+                  <span class="title-missing" title={entry.folder}>
+                    {entry.title}
+                    <span class="badge">missing</span>
+                  </span>
                 {:else}
                   <button class="title-btn" onclick={() => openCourse(entry)} title={entry.folder}>
                     {entry.title}
@@ -252,9 +323,50 @@
               <td class="mtime">{fmtDate(entry.modified_ms)}</td>
               <td class="count">{entry.video_count}</td>
               <td class="actions">
-                <button class="link" onclick={() => startRename(entry)}>Rename</button>
+                {#if entry.source === 'pinned'}
+                  {#if !entry.missing}
+                    <button class="link" onclick={() => startRename(entry)}>Rename</button>
+                  {/if}
+                  <button class="link danger" onclick={() => unpinPinned(entry)} disabled={busy}>
+                    Remove from Library
+                  </button>
+                {:else}
+                  <button class="link" onclick={() => startRename(entry)}>Rename</button>
+                  <button class="link danger" onclick={() => (confirmingFolder = entry.folder)}>
+                    Delete…
+                  </button>
+                {/if}
               </td>
             </tr>
+
+            {#if confirmingFolder === entry.folder}
+              <tr class="confirm-row">
+                <td colspan="4">
+                  <div class="confirm">
+                    <strong>Delete “{entry.title}”?</strong>
+                    <p>
+                      Choose the file disposition deliberately — Remove from Library keeps the
+                      folder on disk; Move to Trash sends it to the macOS Trash.
+                    </p>
+                    <div class="confirm-buttons">
+                      <button class="ghost" onclick={() => (confirmingFolder = null)} disabled={busy}>
+                        Cancel
+                      </button>
+                      <button
+                        class="ghost"
+                        onclick={() => confirmRemoveKeepBytes(entry)}
+                        disabled={busy}
+                      >
+                        Remove from Library (keep bytes)
+                      </button>
+                      <button class="danger-btn" onclick={() => confirmMoveToTrash(entry)} disabled={busy}>
+                        Move to Trash
+                      </button>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+            {/if}
           {/each}
         </tbody>
       </table>
@@ -302,6 +414,7 @@
   .first-launch h2 { margin-top: 0; }
   .hint { color: #666; }
   .toolbar { margin-bottom: 1rem; }
+  .toolbar-buttons { display: flex; gap: 0.5rem; align-items: center; }
   button.primary {
     background: #0066ff;
     color: white;
@@ -322,6 +435,16 @@
     cursor: pointer;
   }
   button.ghost:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.danger-btn {
+    background: #d22020;
+    color: white;
+    border: none;
+    padding: 0.5rem 1rem;
+    border-radius: 6px;
+    font-size: 0.9rem;
+    cursor: pointer;
+  }
+  button.danger-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .new-course-form {
     display: flex;
     gap: 0.5rem;
@@ -341,6 +464,8 @@
     padding: 0;
     font-size: 0.85rem;
   }
+  button.link.danger { color: #b00020; }
+  button.link + button.link { margin-left: 0.75rem; }
   button.title-btn {
     background: none;
     border: none;
@@ -351,6 +476,24 @@
     text-align: left;
   }
   button.title-btn:hover { text-decoration: underline; }
+  .title-missing {
+    color: #888;
+    font-style: italic;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .badge {
+    background: #fceaea;
+    color: #b00020;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-style: normal;
+    letter-spacing: 0.04em;
+  }
+  tr.missing td { background: #fff8f8; }
   .empty {
     background: white;
     padding: 3rem 1rem;
@@ -376,7 +519,11 @@
   table.library tr:last-child td { border-bottom: none; }
   .mtime { color: #666; }
   .count { color: #444; }
-  .actions { text-align: right; }
+  .actions { text-align: right; white-space: nowrap; }
+  .confirm-row td { background: #fafafa; padding: 1rem; }
+  .confirm strong { display: block; margin-bottom: 0.25rem; }
+  .confirm p { margin: 0 0 0.75rem; color: #555; font-size: 0.85rem; }
+  .confirm-buttons { display: flex; gap: 0.5rem; flex-wrap: wrap; }
   .error {
     background: #ffe6e6;
     color: #b00020;

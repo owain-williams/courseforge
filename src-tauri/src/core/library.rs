@@ -139,7 +139,7 @@ mod tests {
         let folder = create_course(root.path(), "Has Videos").unwrap();
         std::fs::write(
             folder.join("course.json"),
-            r#"{"schemaVersion":1,"title":"Has Videos","modules":[],"videos":[{"id":"v1"},{"id":"v2"},{"id":"v3"}]}"#,
+            r#"{"schemaVersion":1,"title":"Has Videos","modules":[],"videos":[{"id":"v1","title":"a"},{"id":"v2","title":"b"},{"id":"v3","title":"c"}]}"#,
         )
         .unwrap();
 

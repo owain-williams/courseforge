@@ -22,6 +22,15 @@ pub enum CoreError {
 
     #[error("not a course folder: {0}")]
     NotACourseFolder(PathBuf),
+
+    #[error("module not found: {0}")]
+    ModuleNotFound(String),
+
+    #[error("video not found: {0}")]
+    VideoNotFound(String),
+
+    #[error("reorder list does not match existing items")]
+    ReorderMismatch,
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

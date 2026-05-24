@@ -8,6 +8,7 @@
     createCourse,
     scanLibrary,
     renameCourse,
+    openCourseWindow,
     pickDirectory,
     type CourseEntry
   } from '$lib/api';
@@ -94,6 +95,15 @@
   function startRename(entry: CourseEntry) {
     renamingFolder = entry.folder;
     renameDraft = entry.title;
+  }
+
+  async function openCourse(entry: CourseEntry) {
+    error = null;
+    try {
+      await openCourseWindow(entry.folder);
+    } catch (e) {
+      error = String(e);
+    }
   }
 
   async function commitRename(entry: CourseEntry) {
@@ -234,7 +244,7 @@
                     }}
                   />
                 {:else}
-                  <button class="title-btn" onclick={() => startRename(entry)} title={entry.folder}>
+                  <button class="title-btn" onclick={() => openCourse(entry)} title={entry.folder}>
                     {entry.title}
                   </button>
                 {/if}

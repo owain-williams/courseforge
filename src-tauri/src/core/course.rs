@@ -18,6 +18,14 @@ pub struct Module {
 pub struct Video {
     pub id: String,
     pub title: String,
+    #[serde(rename = "stateId", default)]
+    pub state_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowState {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,8 +33,46 @@ pub struct Course {
     #[serde(rename = "schemaVersion")]
     pub schema_version: u32,
     pub title: String,
+    #[serde(rename = "workflowStates", default)]
+    pub workflow_states: Vec<WorkflowState>,
     pub modules: Vec<Module>,
     pub videos: Vec<Video>,
+}
+
+/// The canonical default workflow for a brand-new Course. Users can edit
+/// any of these (rename, reorder, remove, add their own); the defaults only
+/// kick in when a Course's `workflow_states` is empty (which is true for
+/// new Courses and for any pre-feature Course we read off disk).
+fn default_workflow_states() -> Vec<WorkflowState> {
+    [
+        ("needs-recording", "Needs Recording"),
+        ("needs-editing", "Needs Editing"),
+        ("needs-intro", "Needs Intro"),
+        ("needs-uploading", "Needs Uploading"),
+        ("done", "Done"),
+    ]
+    .into_iter()
+    .map(|(id, name)| WorkflowState { id: id.to_string(), name: name.to_string() })
+    .collect()
+}
+
+/// Normalize a Course so callers can assume:
+/// - `workflow_states` is non-empty (defaults applied for pre-feature courses).
+/// - every Video's `state_id` is `Some` and references an existing state
+///   (videos with missing / unknown state land in the first state).
+fn ensure_workflow_invariants(course: &mut Course) {
+    if course.workflow_states.is_empty() {
+        course.workflow_states = default_workflow_states();
+    }
+    let first_id = course.workflow_states[0].id.clone();
+    let valid: std::collections::HashSet<&str> =
+        course.workflow_states.iter().map(|s| s.id.as_str()).collect();
+    for v in &mut course.videos {
+        let ok = v.state_id.as_deref().map(|id| valid.contains(id)).unwrap_or(false);
+        if !ok {
+            v.state_id = Some(first_id.clone());
+        }
+    }
 }
 
 fn new_id() -> String {
@@ -38,6 +84,7 @@ impl Course {
         Self {
             schema_version: SCHEMA_VERSION,
             title,
+            workflow_states: default_workflow_states(),
             modules: Vec::new(),
             videos: Vec::new(),
         }
@@ -210,22 +257,118 @@ pub fn delete_module(folder: &Path, module_id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn add_workflow_state(folder: &Path, name: &str) -> Result<WorkflowState> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(CoreError::EmptyTitle);
+    }
+    let state = WorkflowState { id: new_id(), name: name.to_string() };
+    let added = state.clone();
+    mutate_course(folder, |c| {
+        c.workflow_states.push(state);
+        Ok(())
+    })?;
+    Ok(added)
+}
+
+pub fn rename_workflow_state(folder: &Path, state_id: &str, new_name: &str) -> Result<()> {
+    let name = new_name.trim();
+    if name.is_empty() {
+        return Err(CoreError::EmptyTitle);
+    }
+    mutate_course(folder, |c| {
+        let s = c.workflow_states.iter_mut()
+            .find(|s| s.id == state_id)
+            .ok_or_else(|| CoreError::WorkflowStateNotFound(state_id.to_string()))?;
+        s.name = name.to_string();
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub fn reorder_workflow_states(folder: &Path, ordered_ids: &[String]) -> Result<()> {
+    mutate_course(folder, |c| {
+        if !same_set(ordered_ids, c.workflow_states.iter().map(|s| s.id.as_str())) {
+            return Err(CoreError::ReorderMismatch);
+        }
+        c.workflow_states.sort_by_key(|s| {
+            ordered_ids.iter().position(|id| id == &s.id).unwrap()
+        });
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// Remove a workflow state. Any Videos currently in it migrate to
+/// `fallback_state_id`, which must reference a *different* existing state.
+/// The last remaining state cannot be removed — the workflow must always
+/// have at least one state.
+pub fn remove_workflow_state(
+    folder: &Path,
+    state_id: &str,
+    fallback_state_id: &str,
+) -> Result<()> {
+    mutate_course(folder, |c| {
+        if c.workflow_states.len() <= 1 {
+            return Err(CoreError::OnlyWorkflowStateLeft);
+        }
+        if !c.workflow_states.iter().any(|s| s.id == state_id) {
+            return Err(CoreError::WorkflowStateNotFound(state_id.to_string()));
+        }
+        if fallback_state_id == state_id
+            || !c.workflow_states.iter().any(|s| s.id == fallback_state_id)
+        {
+            return Err(CoreError::WorkflowStateNotFound(fallback_state_id.to_string()));
+        }
+        for v in &mut c.videos {
+            if v.state_id.as_deref() == Some(state_id) {
+                v.state_id = Some(fallback_state_id.to_string());
+            }
+        }
+        c.workflow_states.retain(|s| s.id != state_id);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub fn set_video_state(folder: &Path, video_id: &str, state_id: &str) -> Result<()> {
+    mutate_course(folder, |c| {
+        if !c.workflow_states.iter().any(|s| s.id == state_id) {
+            return Err(CoreError::WorkflowStateNotFound(state_id.to_string()));
+        }
+        let v = c.videos.iter_mut()
+            .find(|v| v.id == video_id)
+            .ok_or_else(|| CoreError::VideoNotFound(video_id.to_string()))?;
+        v.state_id = Some(state_id.to_string());
+        Ok(())
+    })?;
+    Ok(())
+}
+
 pub fn add_video(folder: &Path, module_id: &str, title: &str) -> Result<Video> {
     let title = title.trim();
     if title.is_empty() {
         return Err(CoreError::EmptyTitle);
     }
-    let video = Video { id: new_id(), title: title.to_string() };
-    let added = video.clone();
+    // We need the workflow state list to pick the initial state; mutate_course
+    // does the read for us, so build the Video inside the closure.
+    let mut added: Option<Video> = None;
     mutate_course(folder, |c| {
         let m = c.modules.iter_mut()
             .find(|m| m.id == module_id)
             .ok_or_else(|| CoreError::ModuleNotFound(module_id.to_string()))?;
+        let initial_state = c.workflow_states.first().map(|s| s.id.clone());
+        let video = Video {
+            id: new_id(),
+            title: title.to_string(),
+            state_id: initial_state,
+        };
         m.video_ids.push(video.id.clone());
+        added = Some(video.clone());
         c.videos.push(video);
         Ok(())
     })?;
-    Ok(added)
+    Ok(added.unwrap())
 }
 
 pub fn reorder_modules(folder: &Path, ordered_ids: &[String]) -> Result<()> {
@@ -277,7 +420,10 @@ pub fn read_course(folder: &Path) -> Result<Course> {
         path: path.clone(),
         source: e,
     })?;
-    serde_json::from_slice(&bytes).map_err(|e| CoreError::InvalidCourseJson { path, source: e })
+    let mut course: Course = serde_json::from_slice(&bytes)
+        .map_err(|e| CoreError::InvalidCourseJson { path, source: e })?;
+    ensure_workflow_invariants(&mut course);
+    Ok(course)
 }
 
 pub fn rename_course(folder: &Path, new_title: &str) -> Result<PathBuf> {
@@ -722,6 +868,207 @@ mod tests {
             move_video_to_module(&folder, &v.id, "nope", 0),
             Err(CoreError::ModuleNotFound(_))
         ));
+    }
+
+    #[test]
+    fn add_workflow_state_appends_a_state_with_fresh_id() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let s = add_workflow_state(&folder, "Awaiting Review").unwrap();
+        assert!(!s.id.is_empty());
+        assert_eq!(s.name, "Awaiting Review");
+
+        let on_disk = read_course(&folder).unwrap();
+        assert_eq!(on_disk.workflow_states.last().unwrap(), &s);
+    }
+
+    #[test]
+    fn add_workflow_state_rejects_empty_name() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        assert!(matches!(add_workflow_state(&folder, "  "), Err(CoreError::EmptyTitle)));
+    }
+
+    #[test]
+    fn rename_workflow_state_updates_name_in_place() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        rename_workflow_state(&folder, "done", "Shipped").unwrap();
+        let on_disk = read_course(&folder).unwrap();
+        let s = on_disk.workflow_states.iter().find(|s| s.id == "done").unwrap();
+        assert_eq!(s.name, "Shipped");
+    }
+
+    #[test]
+    fn rename_workflow_state_rejects_empty_name() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        assert!(matches!(
+            rename_workflow_state(&folder, "done", " "),
+            Err(CoreError::EmptyTitle)
+        ));
+    }
+
+    #[test]
+    fn rename_workflow_state_errors_when_state_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        assert!(matches!(
+            rename_workflow_state(&folder, "nope", "X"),
+            Err(CoreError::WorkflowStateNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn reorder_workflow_states_permutes_the_list() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        reorder_workflow_states(
+            &folder,
+            &["done", "needs-uploading", "needs-intro", "needs-editing", "needs-recording"]
+                .map(String::from),
+        )
+        .unwrap();
+        let on_disk = read_course(&folder).unwrap();
+        let ids: Vec<&str> = on_disk.workflow_states.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["done", "needs-uploading", "needs-intro", "needs-editing", "needs-recording"]
+        );
+    }
+
+    #[test]
+    fn reorder_workflow_states_rejects_mismatched_id_set() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let result = reorder_workflow_states(&folder, &["done".to_string()]);
+        assert!(matches!(result, Err(CoreError::ReorderMismatch)));
+    }
+
+    #[test]
+    fn set_video_state_updates_persisted_state() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "M").unwrap();
+        let v = add_video(&folder, &m.id, "V").unwrap();
+
+        set_video_state(&folder, &v.id, "done").unwrap();
+
+        let on_disk = read_course(&folder).unwrap();
+        assert_eq!(on_disk.videos[0].state_id.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn set_video_state_errors_for_missing_video() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        assert!(matches!(
+            set_video_state(&folder, "no-such-id", "done"),
+            Err(CoreError::VideoNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn set_video_state_errors_for_missing_state() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "M").unwrap();
+        let v = add_video(&folder, &m.id, "V").unwrap();
+        assert!(matches!(
+            set_video_state(&folder, &v.id, "nope"),
+            Err(CoreError::WorkflowStateNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn remove_workflow_state_moves_videos_to_fallback_state() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "M").unwrap();
+        let v1 = add_video(&folder, &m.id, "A").unwrap();
+        let v2 = add_video(&folder, &m.id, "B").unwrap();
+        set_video_state(&folder, &v1.id, "needs-editing").unwrap();
+        set_video_state(&folder, &v2.id, "needs-editing").unwrap();
+
+        remove_workflow_state(&folder, "needs-editing", "done").unwrap();
+
+        let on_disk = read_course(&folder).unwrap();
+        assert!(on_disk.workflow_states.iter().all(|s| s.id != "needs-editing"));
+        for v in &on_disk.videos {
+            assert_eq!(v.state_id.as_deref(), Some("done"));
+        }
+    }
+
+    #[test]
+    fn remove_workflow_state_errors_when_only_one_state_remains() {
+        // Removing the second-to-last state would leave the workflow empty
+        // once we remove it, which the invariant forbids.
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        // Reduce down to one state.
+        for id in ["needs-editing", "needs-intro", "needs-uploading", "done"] {
+            remove_workflow_state(&folder, id, "needs-recording").unwrap();
+        }
+        let only = read_course(&folder).unwrap();
+        assert_eq!(only.workflow_states.len(), 1);
+        // Now removing the last one must fail.
+        let result = remove_workflow_state(&folder, "needs-recording", "needs-recording");
+        assert!(matches!(result, Err(CoreError::OnlyWorkflowStateLeft)));
+    }
+
+    #[test]
+    fn remove_workflow_state_errors_when_state_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        assert!(matches!(
+            remove_workflow_state(&folder, "no-such-id", "done"),
+            Err(CoreError::WorkflowStateNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn remove_workflow_state_errors_when_fallback_missing_or_same() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        assert!(matches!(
+            remove_workflow_state(&folder, "done", "nope"),
+            Err(CoreError::WorkflowStateNotFound(_))
+        ));
+        assert!(matches!(
+            remove_workflow_state(&folder, "done", "done"),
+            Err(CoreError::WorkflowStateNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn add_video_assigns_first_workflow_state_by_default() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "M").unwrap();
+
+        let v = add_video(&folder, &m.id, "V").unwrap();
+        assert_eq!(v.state_id.as_deref(), Some("needs-recording"));
+
+        let on_disk = read_course(&folder).unwrap();
+        assert_eq!(on_disk.videos[0].state_id.as_deref(), Some("needs-recording"));
+    }
+
+    #[test]
+    fn read_course_populates_default_workflow_states_when_absent() {
+        // A course.json written before this feature existed has no
+        // workflow_states. Reading it should surface the canonical defaults
+        // so the rest of the app can treat workflow_states as non-empty.
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+
+        let on_disk = read_course(&folder).unwrap();
+        let names: Vec<&str> = on_disk.workflow_states.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Needs Recording", "Needs Editing", "Needs Intro", "Needs Uploading", "Done"]
+        );
+        assert_eq!(on_disk.workflow_states[0].id, "needs-recording");
+        assert_eq!(on_disk.workflow_states[4].id, "done");
     }
 
     #[test]

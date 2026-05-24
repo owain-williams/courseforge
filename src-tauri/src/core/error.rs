@@ -32,6 +32,12 @@ pub enum CoreError {
     #[error("reorder list does not match existing items")]
     ReorderMismatch,
 
+    #[error("workflow state not found: {0}")]
+    WorkflowStateNotFound(String),
+
+    #[error("cannot remove the last remaining workflow state")]
+    OnlyWorkflowStateLeft,
+
     #[error("failed to move {path} to Trash: {message}")]
     Trash { path: PathBuf, message: String },
 }

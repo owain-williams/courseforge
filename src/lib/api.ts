@@ -44,10 +44,12 @@ export const renameCourse = (folder: string, newTitle: string) =>
   invoke<string>('rename_course', { folder, newTitle });
 
 export type Module = { id: string; title: string; videoIds: string[] };
-export type Video = { id: string; title: string };
+export type Video = { id: string; title: string; stateId: string | null };
+export type WorkflowState = { id: string; name: string };
 export type Course = {
   schemaVersion: number;
   title: string;
+  workflowStates: WorkflowState[];
   modules: Module[];
   videos: Video[];
 };
@@ -84,6 +86,24 @@ export const moveVideoToModule = (
   targetModuleId: string,
   index: number
 ) => invoke<void>('move_video_to_module', { folder, videoId, targetModuleId, index });
+
+export const addWorkflowState = (folder: string, name: string) =>
+  invoke<WorkflowState>('add_workflow_state', { folder, name });
+
+export const renameWorkflowState = (folder: string, stateId: string, newName: string) =>
+  invoke<void>('rename_workflow_state', { folder, stateId, newName });
+
+export const reorderWorkflowStates = (folder: string, orderedIds: string[]) =>
+  invoke<void>('reorder_workflow_states', { folder, orderedIds });
+
+export const removeWorkflowState = (
+  folder: string,
+  stateId: string,
+  fallbackStateId: string
+) => invoke<void>('remove_workflow_state', { folder, stateId, fallbackStateId });
+
+export const setVideoState = (folder: string, videoId: string, stateId: string) =>
+  invoke<void>('set_video_state', { folder, videoId, stateId });
 
 export const openCourseWindow = (folder: string) =>
   invoke<void>('open_course_window', { folder });

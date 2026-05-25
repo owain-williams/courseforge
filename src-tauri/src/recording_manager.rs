@@ -15,7 +15,7 @@ use crate::core::error::{CoreError, Result};
 use crate::core::permissions::CaptureSources;
 use crate::core::recording::{RecordingSession, SessionState};
 use crate::core::segments;
-use crate::recorder::{ActiveRecording, RecorderBackend};
+use crate::recorder::{self, ActiveRecording, RecorderBackend};
 use crate::remuxer::Remuxer;
 
 /// Snapshot of a session safe to ship over IPC. Mirrors [`RecordingSession`]
@@ -160,6 +160,29 @@ impl RecordingManager {
     pub fn keep_session(&self, id: &str) -> Result<segments::Segment> {
         let mut sessions = self.sessions.lock().unwrap();
         let entry = sessions.get_mut(id).ok_or_else(|| CoreError::SessionNotFound(id.to_string()))?;
+
+        // Diagnostic guard: if the partial vanished (or was never written
+        // because the recorder crashed silently), `finalize_segment` would
+        // only give us `SegmentNotFound(<uuid>)` — useless to the user.
+        // Surface the recorder's stderr log so the real cause (missing
+        // device, permission denial, ffmpeg crash) lands in the error.
+        let partial = entry.session.partial_path.clone();
+        if !partial.is_file() {
+            let log_path = recorder::stderr_log_path(&partial);
+            let tail = recorder::read_log_tail(&log_path, 10)
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "(no recorder log captured)".to_string());
+            let _ = std::fs::remove_file(&log_path);
+            // Evict the dead session so the UI clears the awaiting-decision
+            // banner — replaying Keep on the same id can't succeed.
+            sessions.remove(id);
+            return Err(CoreError::Recorder(format!(
+                "the recording produced no file at {}. Last recorder log:\n{}",
+                partial.display(),
+                tail
+            )));
+        }
+
         entry.session.mark_persisted()?;
         let remuxer = &*self.remuxer;
         let seg = segments::finalize_segment(
@@ -168,6 +191,9 @@ impl RecordingManager {
             &entry.session.segment_id,
             |src, dst| remuxer.remux_to_mp4(src, dst),
         )?;
+        // The stderr log served its purpose; don't leave it cluttering
+        // the segments folder once we've successfully captured.
+        let _ = std::fs::remove_file(recorder::stderr_log_path(&partial));
         sessions.remove(id);
         Ok(seg)
     }
@@ -212,6 +238,9 @@ impl RecordingManager {
             .get_mut(id)
             .ok_or_else(|| CoreError::SessionNotFound(id.to_string()))?;
         entry.session.mark_discarded()?;
+        // Clean up the recorder's stderr log alongside the .partial.mkv;
+        // both belong to the same abandoned take.
+        let _ = std::fs::remove_file(recorder::stderr_log_path(&entry.session.partial_path));
         segments::discard_partial(
             &entry.course_folder,
             &entry.session.video_id,

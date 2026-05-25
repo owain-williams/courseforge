@@ -5,7 +5,7 @@
 //! recording-flow tests can drive the state machine with an in-memory fake
 //! and so the macOS ffmpeg backend stays compiled out on other platforms.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use crate::core::error::Result;
 use crate::core::permissions::CaptureSources;
 
@@ -13,6 +13,32 @@ pub mod fake;
 
 #[cfg(target_os = "macos")]
 pub mod ffmpeg_mac;
+
+/// Convention: backends that capture a child process's stderr write it to
+/// `<partial_path>.stderr.log` alongside the partial file. Callers who
+/// later discover the partial is missing (e.g. `RecordingManager`
+/// on Keep) read the tail of this file to surface the underlying failure.
+///
+/// The fake backend doesn't write one; missing log → empty tail, handled
+/// gracefully by readers.
+pub fn stderr_log_path(partial_path: &Path) -> PathBuf {
+    let parent = partial_path.parent().unwrap_or(Path::new("."));
+    let name = partial_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "recording".to_string());
+    parent.join(format!("{name}.stderr.log"))
+}
+
+/// Read at most `n` trailing lines from `path`. Returns `None` if the file
+/// is missing or unreadable so callers can substitute their own fallback
+/// text without dealing with errors.
+pub fn read_log_tail(path: &Path, n: usize) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = contents.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    Some(lines[start..].join("\n"))
+}
 
 /// Factory for per-session recording handles. Lives in Tauri-managed state
 /// as a `Box<dyn RecorderBackend>` so commands can mint a fresh

@@ -15,6 +15,7 @@
 //! The Recorder trait is what callers see; everything in this file is an
 //! implementation detail behind it.
 
+use std::fs::File;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -22,13 +23,29 @@ use std::time::{Duration, Instant};
 
 use crate::core::error::{CoreError, Result};
 use crate::core::permissions::CaptureSources;
-use super::{ActiveRecording, RecorderBackend};
+use super::{read_log_tail, stderr_log_path, ActiveRecording, RecorderBackend};
+
+/// How long to wait after `spawn` to see if ffmpeg dies on startup before
+/// declaring the recording successfully started. Long enough for
+/// avfoundation to surface "device not found" / "permission denied"
+/// (these show up in well under 100 ms), short enough that the user
+/// doesn't notice. Without this check a startup crash looks identical to
+/// a successful recording until Keep time — at which point the partial
+/// file is missing and we have no idea why.
+const STARTUP_HEALTHCHECK: Duration = Duration::from_millis(300);
+
+/// How many trailing lines of `ffmpeg`'s stderr to splice into a failure
+/// message. ffmpeg's "warning"-level logging is terse, so a handful of
+/// lines is usually enough to spot a missing device or a permission error.
+const STDERR_TAIL_LINES: usize = 10;
 
 /// How long to wait for ffmpeg to finalise the output file after asking
 /// nicely (SIGINT) before escalating. 5 seconds is comfortable for a
 /// short clip — a longer recording finishing writing a few extra
 /// megabytes shouldn't need more than this.
 const STOP_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(5);
+
+
 
 /// After SIGTERM, how long before we hard-kill. SIGTERM gives ffmpeg
 /// another chance to clean up; if it's still stuck after this, the file
@@ -113,13 +130,42 @@ impl RecorderBackend for FfmpegMacBackend {
             cmd.args(["-c:a", "aac", "-b:a", "128k"]);
         }
         cmd.arg("-y").arg(&partial_path);
+
+        // Capture stderr to a sibling log file so we can surface useful
+        // diagnostics (avfoundation device errors, permission denials,
+        // codec failures, …) when a recording goes wrong. Without this,
+        // ffmpeg's chatter went to /dev/null and silent startup crashes
+        // were indistinguishable from successful recordings until Keep
+        // time discovered the missing file.
+        let log_path = stderr_log_path(&partial_path);
+        let stderr_log = File::create(&log_path).map_err(|e| CoreError::Io {
+            path: log_path.clone(),
+            source: e,
+        })?;
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::from(stderr_log));
 
-        let child = cmd.spawn().map_err(|e| {
+        let mut child = cmd.spawn().map_err(|e| {
             CoreError::Recorder(format!("failed to spawn ffmpeg ({}): {e}", ffmpeg.display()))
         })?;
+
+        // Brief liveness check. ffmpeg returning instantly almost always
+        // means avfoundation rejected the device or the OS denied screen-
+        // recording permission. Fail Start with the cause so the UI never
+        // shows "Recording" for a process that already died.
+        std::thread::sleep(STARTUP_HEALTHCHECK);
+        if let Ok(Some(status)) = child.try_wait() {
+            let tail = read_log_tail(&log_path, STDERR_TAIL_LINES)
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "(no ffmpeg output captured)".to_string());
+            // Tidy up — neither the partial nor its log are useful now.
+            let _ = std::fs::remove_file(&log_path);
+            let _ = std::fs::remove_file(&partial_path);
+            return Err(CoreError::Recorder(format!(
+                "ffmpeg exited immediately ({status}). Last log lines:\n{tail}"
+            )));
+        }
 
         Ok(Box::new(FfmpegRecording {
             child: Mutex::new(Some(child)),

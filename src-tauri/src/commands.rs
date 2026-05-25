@@ -6,7 +6,9 @@ use crate::core::permissions::{
     self, CaptureSources, PermissionsSnapshot, SettingsPane,
 };
 use crate::core::segments::{self, OrphanSegment, Segment};
+use crate::core::transcript::{self, Transcript};
 use crate::recording_manager::{RecordingManager, SessionSnapshot};
+use crate::transcription_manager::{TranscriptionJob, TranscriptionManager};
 use crate::windows::{CourseWindowRegistry, OpenDecision};
 
 #[derive(Debug, Serialize)]
@@ -343,9 +345,20 @@ pub fn stop_recording(
 #[tauri::command]
 pub fn keep_segment(
     manager: tauri::State<'_, RecordingManager>,
+    transcription: tauri::State<'_, TranscriptionManager>,
     session_id: String,
 ) -> Result<Segment, AppError> {
-    Ok(manager.keep_session(&session_id)?)
+    // Snapshot the session so we know which Course/Video to transcribe
+    // *before* keep_session evicts it from the registry.
+    let sessions = manager.list_sessions();
+    let snap = sessions.into_iter().find(|s| s.id == session_id);
+
+    let seg = manager.keep_session(&session_id)?;
+
+    if let Some(snap) = snap {
+        transcription.enqueue(snap.course_folder, snap.video_id);
+    }
+    Ok(seg)
 }
 
 #[tauri::command]
@@ -397,4 +410,28 @@ pub fn discard_orphan_segment(
     segment_id: String,
 ) -> Result<(), AppError> {
     Ok(segments::discard_partial(&folder, &video_id, &segment_id)?)
+}
+
+// ---------------------------------------------------------------------------
+// Transcription
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn list_transcription_jobs(
+    transcription: tauri::State<'_, TranscriptionManager>,
+) -> Vec<TranscriptionJob> {
+    transcription.jobs()
+}
+
+#[tauri::command]
+pub fn retry_transcription(
+    transcription: tauri::State<'_, TranscriptionManager>,
+    video_id: String,
+) -> Result<(), AppError> {
+    Ok(transcription.retry(&video_id)?)
+}
+
+#[tauri::command]
+pub fn get_transcript(folder: PathBuf, video_id: String) -> Result<Option<Transcript>, AppError> {
+    Ok(transcript::read_transcript(&folder, &video_id)?)
 }

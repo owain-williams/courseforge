@@ -6,5 +6,6 @@ pub mod permissions;
 pub mod recording;
 pub mod segments;
 pub mod slug;
+pub mod transcript;
 
 pub use error::CoreError;

@@ -1,15 +1,19 @@
 //! Pluggable ASR backends.
 //!
 //! Like the recorder, this module abstracts *how words come out of a Segment
-//! file*. The default v1 plan (HITL on issue #8) is local whisper.cpp via a
-//! follow-up PR; meanwhile a `FakeTranscriberBackend` keeps the queue,
-//! persistence, and UI honest under test.
+//! file*. In production on macOS we hand back a [`whisper::WhisperBackend`]
+//! that runs local whisper.cpp inference; on other platforms (and in unit
+//! tests that wire the manager up directly) the [`fake`] backend keeps the
+//! queue, persistence, and UI honest.
 
 use std::path::Path;
 use crate::core::error::Result;
 use crate::core::transcript::Word;
 
 pub mod fake;
+pub mod model;
+#[cfg(target_os = "macos")]
+pub mod whisper;
 
 /// A backend turns a Segment file into a stream of timestamped words.
 ///
@@ -38,8 +42,19 @@ impl ProgressSink for NullProgressSink {
     fn report(&self, _fraction: f64) {}
 }
 
-/// Pick a backend for production. For now we always hand back the fake —
-/// the real whisper.cpp impl lands in a follow-up (see issue #8 thread).
+/// Pick a backend for the current platform. macOS production builds get the
+/// real whisper.cpp backend with the default model variant; everywhere else
+/// (and in headless test setups that wire the manager up directly) falls
+/// back to the scripted fake so the rest of the app still links and runs.
 pub fn default_backend() -> Box<dyn TranscriberBackend> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(dir) = whisper::WhisperBackend::default_models_dir() {
+            return Box::new(whisper::WhisperBackend::new(
+                dir,
+                model::WhisperModel::BaseEn,
+            ));
+        }
+    }
     Box::new(fake::FakeTranscriberBackend::default())
 }

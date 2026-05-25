@@ -16,6 +16,7 @@ use crate::core::permissions::CaptureSources;
 use crate::core::recording::{RecordingSession, SessionState};
 use crate::core::segments;
 use crate::recorder::{ActiveRecording, RecorderBackend};
+use crate::remuxer::Remuxer;
 
 /// Snapshot of a session safe to ship over IPC. Mirrors [`RecordingSession`]
 /// (the field names line up so the frontend can deserialize the same shape).
@@ -55,12 +56,17 @@ impl ActiveSession {
 
 pub struct RecordingManager {
     backend: Box<dyn RecorderBackend>,
+    remuxer: Box<dyn Remuxer>,
     sessions: Mutex<HashMap<String, ActiveSession>>,
 }
 
 impl RecordingManager {
-    pub fn new(backend: Box<dyn RecorderBackend>) -> Self {
-        Self { backend, sessions: Mutex::new(HashMap::new()) }
+    pub fn new(backend: Box<dyn RecorderBackend>, remuxer: Box<dyn Remuxer>) -> Self {
+        Self {
+            backend,
+            remuxer,
+            sessions: Mutex::new(HashMap::new()),
+        }
     }
 
     /// True iff there is any session not in a terminal state. The UI uses
@@ -148,19 +154,38 @@ impl RecordingManager {
         Ok(entry.snapshot())
     }
 
-    /// "Keep". Finalises the `.partial.mkv`, drops the session from the
-    /// registry, and returns the new Segment record so callers can update UI.
+    /// "Keep". Finalises the `.partial.mkv` (remuxing it to `<id>.mp4`),
+    /// drops the session from the registry, and returns the new Segment
+    /// record so callers can update UI.
     pub fn keep_session(&self, id: &str) -> Result<segments::Segment> {
         let mut sessions = self.sessions.lock().unwrap();
         let entry = sessions.get_mut(id).ok_or_else(|| CoreError::SessionNotFound(id.to_string()))?;
         entry.session.mark_persisted()?;
+        let remuxer = &*self.remuxer;
         let seg = segments::finalize_segment(
             &entry.course_folder,
             &entry.session.video_id,
             &entry.session.segment_id,
+            |src, dst| remuxer.remux_to_mp4(src, dst),
         )?;
         sessions.remove(id);
         Ok(seg)
+    }
+
+    /// Adopt a crash-recovered `.partial.mkv` as a finished Segment. Same
+    /// remux path as `keep_session` — the only difference is that no live
+    /// `RecordingSession` is involved, so we don't need to update session
+    /// state.
+    pub fn adopt_orphan(
+        &self,
+        course_folder: &Path,
+        video_id: &str,
+        segment_id: &str,
+    ) -> Result<segments::Segment> {
+        let remuxer = &*self.remuxer;
+        segments::finalize_segment(course_folder, video_id, segment_id, |src, dst| {
+            remuxer.remux_to_mp4(src, dst)
+        })
     }
 
     /// "Discard". Tears the recorder down if it's still running, removes the
@@ -220,6 +245,7 @@ impl RecordingManager {
 mod tests {
     use super::*;
     use crate::recorder::fake::FakeRecorderBackend;
+    use crate::remuxer::fake::FakeRemuxer;
 
     fn course_with_video() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
@@ -238,7 +264,10 @@ mod tests {
         // We hand the manager its own backend, but keep a clone of the event
         // log on the side so tests can assert on it.
         let log_backend = FakeRecorderBackend { events: backend.shared_log() };
-        let mgr = RecordingManager::new(Box::new(log_backend));
+        let mgr = RecordingManager::new(
+            Box::new(log_backend),
+            Box::new(FakeRemuxer::default()),
+        );
         (mgr, backend)
     }
 
@@ -304,9 +333,9 @@ mod tests {
         assert_eq!(seg.video_id, vid);
         assert_eq!(seg.id, snap.segment_id);
 
-        // Final .mkv exists, .partial.mkv is gone.
+        // Final .mp4 exists (remuxed from .partial.mkv), .partial.mkv is gone.
         let segs_dir = course_folder(&dir).join("videos").join(&vid).join("segments");
-        assert!(segs_dir.join(format!("{}.mkv", seg.id)).is_file());
+        assert!(segs_dir.join(format!("{}.mp4", seg.id)).is_file());
         assert!(!segs_dir.join(format!("{}.partial.mkv", seg.id)).exists());
 
         // Session is gone from the registry.

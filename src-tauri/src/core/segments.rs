@@ -2,21 +2,25 @@
 //!
 //! On disk, per ADR-0001 and CONTEXT.md, downstream per-Video state lives in
 //! per-Video subfolders rather than inside `course.json`. Segments follow that
-//! rule: they sit at `videos/<video-id>/segments/<segment-id>.mkv`, and the
+//! rule: they sit at `videos/<video-id>/segments/<segment-id>.mp4`, and the
 //! Library / Course view discovers them by scanning the folder — there is no
 //! segments[] array in `course.json` that could drift out of sync.
 //!
-//! During capture a segment is written as `<id>.partial.mkv`. On a clean Stop
-//! the user is asked Keep / Discard; Keep renames it to `<id>.mkv` (the marker
-//! that promotes it to a real Segment), Discard removes it. If the app or OS
-//! crashes mid-capture the `.partial.mkv` is left behind; on next launch we
-//! offer those orphans back to the user as importable Segments.
+//! During capture a segment is written as `<id>.partial.mkv`. Matroska is
+//! robust to abrupt termination (the WebKit `<video>` element can't play it
+//! though). On a clean Stop the user is asked Keep / Discard; Keep
+//! losslessly **remuxes** the `.partial.mkv` into `<id>.mp4` via a caller-
+//! supplied closure — the streams are stream-copied, not re-encoded — and
+//! removes the `.partial.mkv`. Discard removes the `.partial.mkv` directly.
+//! If the app or OS crashes mid-capture the `.partial.mkv` is left behind;
+//! on next launch we offer those orphans back to the user as importable
+//! Segments (which also goes through the remux step).
 
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use crate::core::error::{CoreError, Result};
 
-pub const SEGMENT_EXT: &str = "mkv";
+pub const SEGMENT_EXT: &str = "mp4";
 pub const PARTIAL_SUFFIX: &str = "partial.mkv";
 
 /// A finalised Segment on disk. Discovered by scanning, not stored in course.json.
@@ -65,18 +69,29 @@ pub fn prepare_segment_path(folder: &Path, video_id: &str) -> Result<(String, Pa
     Ok((id, path))
 }
 
-/// Rename `<id>.partial.mkv` → `<id>.mkv`, promoting an in-progress capture
-/// to a real Segment. Idempotent-ish: if `.partial.mkv` is missing but the
-/// final `.mkv` already exists we treat that as already-finalised and return
-/// it; otherwise we error.
-pub fn finalize_segment(folder: &Path, video_id: &str, segment_id: &str) -> Result<Segment> {
+/// Remux `<id>.partial.mkv` → `<id>.mp4` and drop the partial, promoting an
+/// in-progress capture to a real Segment. The remux is delegated to the
+/// caller-supplied `remux_fn` so this module stays platform-agnostic and
+/// tests can substitute a byte-for-byte copy. Idempotent-ish: if
+/// `.partial.mkv` is missing but the final `.mp4` already exists we treat
+/// that as already-finalised and return it; otherwise we error.
+pub fn finalize_segment(
+    folder: &Path,
+    video_id: &str,
+    segment_id: &str,
+    remux_fn: impl FnOnce(&Path, &Path) -> Result<()>,
+) -> Result<Segment> {
     let dir = segments_dir(folder, video_id);
     let partial = dir.join(format!("{segment_id}.{PARTIAL_SUFFIX}"));
     let final_path = dir.join(format!("{segment_id}.{SEGMENT_EXT}"));
 
     if partial.is_file() {
-        std::fs::rename(&partial, &final_path).map_err(|e| CoreError::Io {
-            path: final_path.clone(),
+        remux_fn(&partial, &final_path)?;
+        // Drop the partial once the MP4 is durably written. If removal fails
+        // it's not fatal — the next finalize call will short-circuit on the
+        // existing MP4 — but we propagate so callers can log.
+        std::fs::remove_file(&partial).map_err(|e| CoreError::Io {
+            path: partial.clone(),
             source: e,
         })?;
     } else if !final_path.is_file() {
@@ -107,7 +122,7 @@ pub fn discard_partial(folder: &Path, video_id: &str, segment_id: &str) -> Resul
 
 /// List finalised Segments for a Video by scanning its segments folder.
 /// Hidden files, the `.partial.mkv` workfiles and anything that isn't a plain
-/// `<id>.mkv` are skipped. Order is by filename so the result is stable for
+/// `<id>.mp4` are skipped. Order is by filename so the result is stable for
 /// tests and for UI rendering.
 pub fn list_segments(folder: &Path, video_id: &str) -> Result<Vec<Segment>> {
     let dir = segments_dir(folder, video_id);
@@ -213,6 +228,17 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    /// Stand-in for the real ffmpeg remux: just copy bytes. The test doesn't
+    /// care that the output isn't a real MP4, only that finalize_segment
+    /// calls the remuxer, removes the partial, and returns the right path.
+    fn copy_remux(src: &Path, dst: &Path) -> Result<()> {
+        std::fs::copy(src, dst).map_err(|e| CoreError::Io {
+            path: dst.to_path_buf(),
+            source: e,
+        })?;
+        Ok(())
+    }
+
     #[test]
     fn prepare_segment_path_creates_segments_dir_and_returns_partial_under_it() {
         let f = course_folder();
@@ -236,12 +262,12 @@ mod tests {
     }
 
     #[test]
-    fn finalize_segment_renames_partial_to_final_and_returns_relative_path() {
+    fn finalize_segment_remuxes_partial_to_mp4_and_returns_relative_path() {
         let f = course_folder();
         let (id, partial) = prepare_segment_path(f.path(), "vid-1").unwrap();
         std::fs::write(&partial, b"FAKE-MKV").unwrap();
 
-        let seg = finalize_segment(f.path(), "vid-1", &id).unwrap();
+        let seg = finalize_segment(f.path(), "vid-1", &id, copy_remux).unwrap();
         assert_eq!(seg.id, id);
         assert_eq!(seg.video_id, "vid-1");
         assert_eq!(
@@ -249,8 +275,29 @@ mod tests {
             PathBuf::from("videos").join("vid-1").join("segments").join(format!("{id}.{SEGMENT_EXT}"))
         );
 
-        assert!(!partial.exists(), "partial should be gone");
-        assert!(f.path().join(&seg.path).is_file(), "final .mkv should exist");
+        assert!(!partial.exists(), "partial should be gone after remux");
+        assert!(f.path().join(&seg.path).is_file(), "final .mp4 should exist");
+    }
+
+    #[test]
+    fn finalize_segment_propagates_remux_failures_and_leaves_no_final_file() {
+        let f = course_folder();
+        let (id, partial) = prepare_segment_path(f.path(), "vid-1").unwrap();
+        std::fs::write(&partial, b"x").unwrap();
+        let final_path = f
+            .path()
+            .join("videos")
+            .join("vid-1")
+            .join("segments")
+            .join(format!("{id}.{SEGMENT_EXT}"));
+
+        let fail_remux = |_src: &Path, _dst: &Path| -> Result<()> {
+            Err(CoreError::Recorder("nope".into()))
+        };
+        let err = finalize_segment(f.path(), "vid-1", &id, fail_remux).unwrap_err();
+        assert!(matches!(err, CoreError::Recorder(_)));
+        assert!(partial.exists(), "partial must be preserved so the user can retry");
+        assert!(!final_path.exists(), "no half-finalised .mp4 should be left behind");
     }
 
     #[test]
@@ -258,19 +305,19 @@ mod tests {
         let f = course_folder();
         let (id, partial) = prepare_segment_path(f.path(), "vid-1").unwrap();
         std::fs::write(&partial, b"x").unwrap();
-        let _ = finalize_segment(f.path(), "vid-1", &id).unwrap();
+        let _ = finalize_segment(f.path(), "vid-1", &id, copy_remux).unwrap();
 
         // Calling again with the partial gone but the final present should
         // not fail — Keep is a user-driven action and we don't want
         // double-clicks or replays to error.
-        let seg = finalize_segment(f.path(), "vid-1", &id).unwrap();
+        let seg = finalize_segment(f.path(), "vid-1", &id, copy_remux).unwrap();
         assert_eq!(seg.id, id);
     }
 
     #[test]
     fn finalize_segment_errors_when_neither_partial_nor_final_exists() {
         let f = course_folder();
-        let result = finalize_segment(f.path(), "vid-1", "no-such-segment");
+        let result = finalize_segment(f.path(), "vid-1", "no-such-segment", copy_remux);
         assert!(matches!(result, Err(CoreError::SegmentNotFound(_))));
     }
 
@@ -297,7 +344,7 @@ mod tests {
         let f = course_folder();
         let (id, partial) = prepare_segment_path(f.path(), "vid-1").unwrap();
         std::fs::write(&partial, b"x").unwrap();
-        let _ = finalize_segment(f.path(), "vid-1", &id).unwrap();
+        let _ = finalize_segment(f.path(), "vid-1", &id, copy_remux).unwrap();
 
         discard_partial(f.path(), "vid-1", &id).unwrap();
         let final_path = f.path().join("videos").join("vid-1").join("segments").join(format!("{id}.{SEGMENT_EXT}"));
@@ -316,7 +363,7 @@ mod tests {
         let f = course_folder();
         let (id_keep, p_keep) = prepare_segment_path(f.path(), "vid-1").unwrap();
         std::fs::write(&p_keep, b"x").unwrap();
-        let _ = finalize_segment(f.path(), "vid-1", &id_keep).unwrap();
+        let _ = finalize_segment(f.path(), "vid-1", &id_keep, copy_remux).unwrap();
 
         // A still-in-progress one and a dotfile that should be ignored.
         let (_, p_partial) = prepare_segment_path(f.path(), "vid-1").unwrap();
@@ -343,7 +390,7 @@ mod tests {
         // A finalised one in vid-1 — should NOT show up as an orphan.
         let (id_c, pc) = prepare_segment_path(f.path(), "vid-1").unwrap();
         std::fs::write(&pc, b"x").unwrap();
-        let _ = finalize_segment(f.path(), "vid-1", &id_c).unwrap();
+        let _ = finalize_segment(f.path(), "vid-1", &id_c, copy_remux).unwrap();
 
         let mut orphans = scan_orphans(f.path()).unwrap();
         orphans.sort_by(|a, b| a.id.cmp(&b.id));

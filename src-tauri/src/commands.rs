@@ -392,14 +392,16 @@ pub fn scan_orphan_segments(folder: PathBuf) -> Result<Vec<OrphanSegment>, AppEr
 }
 
 /// Adopt an orphan `.partial.mkv` as a finished Segment (Keep equivalent for
-/// crash-recovered files).
+/// crash-recovered files). Goes through the same remux step as `keep`, so
+/// the resulting `.mp4` plays in the WebKit `<video>` element.
 #[tauri::command]
 pub fn import_orphan_segment(
+    manager: tauri::State<'_, RecordingManager>,
     folder: PathBuf,
     video_id: String,
     segment_id: String,
 ) -> Result<Segment, AppError> {
-    Ok(segments::finalize_segment(&folder, &video_id, &segment_id)?)
+    Ok(manager.adopt_orphan(&folder, &video_id, &segment_id)?)
 }
 
 /// Delete an orphan `.partial.mkv` (Discard equivalent for crash-recovered files).

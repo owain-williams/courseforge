@@ -17,6 +17,7 @@ use courseforge_lib::core::transcript::{self, Word};
 use courseforge_lib::recorder::fake::FakeRecorderBackend;
 use courseforge_lib::recording_manager::RecordingManager;
 use courseforge_lib::transcriber::fake::{FakeTranscriberBackend, ScriptedResponse};
+use courseforge_lib::remuxer::fake::FakeRemuxer;
 use courseforge_lib::transcription_manager::{JobStatus, TranscriptionManager};
 
 fn course_with_video() -> (tempfile::TempDir, PathBuf, String) {
@@ -28,7 +29,10 @@ fn course_with_video() -> (tempfile::TempDir, PathBuf, String) {
 }
 
 fn fresh_recording_manager() -> RecordingManager {
-    RecordingManager::new(Box::new(FakeRecorderBackend::default()))
+    RecordingManager::new(
+        Box::new(FakeRecorderBackend::default()),
+        Box::new(FakeRemuxer::default()),
+    )
 }
 
 fn fresh_transcription_managers() -> (TranscriptionManager, std::sync::Arc<FakeTranscriberBackend>) {

@@ -47,7 +47,8 @@
     type OrphanSegment,
     type CaptureSources,
     type Transcript,
-    type TranscriptionJob
+    type TranscriptionJob,
+    formatError
   } from '$lib/api';
 
   let folder = $state<string | null>(null);
@@ -108,7 +109,7 @@
     try {
       course = await readCourse(folder);
     } catch (e) {
-      error = String(e);
+      error = formatError(e);
     }
   }
 
@@ -123,7 +124,7 @@
     try {
       return await fn();
     } catch (e) {
-      error = String(e);
+      error = formatError(e);
     } finally {
       busy = false;
     }
@@ -566,7 +567,7 @@
     try {
       await openSettingsPane(pane);
     } catch (e) {
-      error = String(e);
+      error = formatError(e);
     }
   }
 
@@ -643,7 +644,7 @@
       await retryTranscription(videoId);
       await refreshJobs();
     } catch (e) {
-      error = String(e);
+      error = formatError(e);
     }
   }
 
@@ -762,7 +763,7 @@
           console.warn('onCloseRequested wiring failed', e);
         }
       } catch (e) {
-        error = String(e);
+        error = formatError(e);
       }
     })();
     return () => {

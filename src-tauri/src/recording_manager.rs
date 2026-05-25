@@ -129,12 +129,29 @@ impl RecordingManager {
     }
 
     pub fn stop_session(&self, id: &str) -> Result<SessionSnapshot> {
-        self.with_session(id, |s| {
-            if let Some(rec) = s.recording.take() {
-                rec.stop()?;
-            }
-            s.session.stop()
-        })
+        // Take the recording handle out under the lock, then drop the lock
+        // before driving the backend's stop — ffmpeg shutdown can take a
+        // few seconds and we don't want every other IPC call to block on
+        // it. The session row stays in the registry (with `recording: None`)
+        // so the UI's id-based addressing still works.
+        let recording = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let entry = sessions
+                .get_mut(id)
+                .ok_or_else(|| CoreError::SessionNotFound(id.to_string()))?;
+            entry.recording.take()
+        };
+
+        if let Some(rec) = recording {
+            rec.stop()?;
+        }
+
+        let mut sessions = self.sessions.lock().unwrap();
+        let entry = sessions
+            .get_mut(id)
+            .ok_or_else(|| CoreError::SessionNotFound(id.to_string()))?;
+        entry.session.stop()?;
+        Ok(entry.snapshot())
     }
 
     /// "Keep". Finalises the `.partial.mkv` (remuxing it to `<id>.mp4`),
@@ -174,13 +191,26 @@ impl RecordingManager {
     /// "Discard". Tears the recorder down if it's still running, removes the
     /// `.partial.mkv`, drops the session from the registry.
     pub fn discard_session(&self, id: &str) -> Result<()> {
-        let mut sessions = self.sessions.lock().unwrap();
-        let entry = sessions.get_mut(id).ok_or_else(|| CoreError::SessionNotFound(id.to_string()))?;
-        if let Some(rec) = entry.recording.take() {
-            // Best-effort stop; failure here shouldn't block the discard, but
-            // do propagate so callers can surface it if interesting.
+        // Same shape as `stop_session`: take the recording out under the
+        // lock, drop the lock, run the (potentially slow) backend stop,
+        // then re-acquire for the bookkeeping.
+        let recording = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let entry = sessions
+                .get_mut(id)
+                .ok_or_else(|| CoreError::SessionNotFound(id.to_string()))?;
+            entry.recording.take()
+        };
+        if let Some(rec) = recording {
+            // Best-effort stop — Discard must always succeed at evicting the
+            // session even if the backend tear-down complains.
             let _ = rec.stop();
         }
+
+        let mut sessions = self.sessions.lock().unwrap();
+        let entry = sessions
+            .get_mut(id)
+            .ok_or_else(|| CoreError::SessionNotFound(id.to_string()))?;
         entry.session.mark_discarded()?;
         segments::discard_partial(
             &entry.course_folder,

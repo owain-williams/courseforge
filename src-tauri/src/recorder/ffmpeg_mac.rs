@@ -18,10 +18,22 @@
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::core::error::{CoreError, Result};
 use crate::core::permissions::CaptureSources;
 use super::{ActiveRecording, RecorderBackend};
+
+/// How long to wait for ffmpeg to finalise the output file after asking
+/// nicely (SIGINT) before escalating. 5 seconds is comfortable for a
+/// short clip — a longer recording finishing writing a few extra
+/// megabytes shouldn't need more than this.
+const STOP_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// After SIGTERM, how long before we hard-kill. SIGTERM gives ffmpeg
+/// another chance to clean up; if it's still stuck after this, the file
+/// is likely already lost so we move on.
+const STOP_TERM_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct FfmpegMacBackend {
     ffmpeg_path: Option<PathBuf>,
@@ -133,17 +145,45 @@ impl FfmpegRecording {
 
     fn signal(&self, signal: &str) -> Result<()> {
         let pid = self.pid()?;
-        // Shelling out to /bin/kill avoids pulling in libc/nix for one syscall.
-        let status = Command::new("/bin/kill")
-            .args([signal, &pid.to_string()])
-            .status()
-            .map_err(|e| CoreError::Recorder(format!("kill {signal} failed: {e}")))?;
-        if !status.success() {
-            return Err(CoreError::Recorder(format!(
-                "kill {signal} pid {pid} exited with {status}"
-            )));
+        send_signal(pid, signal)
+    }
+}
+
+/// Shell out to `/bin/kill` to send a signal by pid. Pulled out as a free
+/// function so `stop()` can call it after taking ownership of the `Child`
+/// (which makes `self.pid()` unavailable).
+fn send_signal(pid: u32, signal: &str) -> Result<()> {
+    let status = Command::new("/bin/kill")
+        .args([signal, &pid.to_string()])
+        .status()
+        .map_err(|e| CoreError::Recorder(format!("kill {signal} failed: {e}")))?;
+    if !status.success() {
+        return Err(CoreError::Recorder(format!(
+            "kill {signal} pid {pid} exited with {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Poll `try_wait` until the child exits or `timeout` elapses. Returns
+/// `true` iff the child exited within the budget. We poll because the
+/// stdlib's `Child::wait` is unbounded and there's no `wait_timeout` in
+/// std (the crate of that name would add a dep for one syscall).
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // try_wait erroring usually means the process is already
+            // reaped — treat as exited so we don't loop forever.
+            Err(_) => return true,
         }
-        Ok(())
     }
 }
 
@@ -158,18 +198,40 @@ impl ActiveRecording for FfmpegRecording {
     }
 
     fn stop(&self) -> Result<()> {
-        let mut guard = self.child.lock().unwrap();
-        if let Some(mut child) = guard.take() {
-            // Ask ffmpeg to finalise cleanly. Writing 'q' to its stdin is the
-            // documented graceful-exit signal and leaves a valid MKV trailer.
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write;
-                let _ = stdin.write_all(b"q");
-                let _ = stdin.flush();
-            }
-            // Give it a beat to flush; on timeout, fall through to kill.
-            let _ = child.wait();
+        let mut child = match self.child.lock().unwrap().take() {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        let pid = child.id();
+
+        // 1. SIGCONT — defensive. If the user paused (SIGSTOP) then went
+        //    straight to Stop, ffmpeg can't act on any later signal until
+        //    it's resumed. SIGCONT on an already-running process is a no-op.
+        let _ = send_signal(pid, "-CONT");
+
+        // 2. SIGINT — the documented graceful shutdown for ffmpeg. Far more
+        //    reliable than writing `q` to stdin: with `-i avfoundation` the
+        //    main loop is busy draining the capture device and rarely polls
+        //    stdin promptly, which was hanging Stop indefinitely.
+        let _ = send_signal(pid, "-INT");
+        // Drop stdin so a still-active polling read sees EOF too.
+        drop(child.stdin.take());
+
+        if wait_with_timeout(&mut child, STOP_GRACEFUL_TIMEOUT) {
+            return Ok(());
         }
+
+        // 3. Escalate to SIGTERM. ffmpeg may not finalise the file cleanly
+        //    from here, but discard+re-record is a survivable fallback.
+        let _ = send_signal(pid, "-TERM");
+        if wait_with_timeout(&mut child, STOP_TERM_TIMEOUT) {
+            return Ok(());
+        }
+
+        // 4. Last resort — guarantees the lock-holding caller eventually
+        //    returns rather than wedging the UI on a stuck ffmpeg.
+        let _ = child.kill();
+        let _ = child.wait();
         Ok(())
     }
 }

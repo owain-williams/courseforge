@@ -21,6 +21,11 @@ thiserror = "2"
 dirs = "5"
 uuid = { version = "1", features = ["v4"] }
 trash = "5"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+hound = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16", features = ["metal"] }
 
 [dev-dependencies]
 tempfile = "3"

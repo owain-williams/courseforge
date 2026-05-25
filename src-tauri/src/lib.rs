@@ -87,6 +87,10 @@ pub fn run() {
             commands::list_transcription_jobs,
             commands::retry_transcription,
             commands::get_transcript,
+            commands::get_edit_state,
+            commands::add_cut,
+            commands::undo_edit,
+            commands::redo_edit,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

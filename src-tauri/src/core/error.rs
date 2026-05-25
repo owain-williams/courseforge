@@ -24,6 +24,16 @@ pub enum CoreError {
         source: serde_json::Error,
     },
 
+    #[error("invalid edits.json at {path}: {source}")]
+    InvalidEditsJson {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("invalid cut: end ({end}) must be greater than start ({start})")]
+    InvalidCut { start: f64, end: f64 },
+
     #[error("title cannot be empty")]
     EmptyTitle,
 

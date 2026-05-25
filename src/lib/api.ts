@@ -280,3 +280,31 @@ export const retryTranscription = (videoId: string) =>
 
 export const getTranscript = (folder: string, videoId: string) =>
   invoke<Transcript | null>('get_transcript', { folder, videoId });
+
+// ---------------------------------------------------------------------------
+// Transcript-driven edits (EDL)
+// ---------------------------------------------------------------------------
+
+export type Cut = {
+  id: string;
+  startSec: number;
+  endSec: number;
+};
+
+export type EditState = {
+  cuts: Cut[];
+  canUndo: boolean;
+  canRedo: boolean;
+};
+
+export const getEditState = (folder: string, videoId: string) =>
+  invoke<EditState>('get_edit_state', { folder, videoId });
+
+export const addCut = (folder: string, videoId: string, startSec: number, endSec: number) =>
+  invoke<EditState>('add_cut', { folder, videoId, startSec, endSec });
+
+export const undoEdit = (folder: string, videoId: string) =>
+  invoke<EditState>('undo_edit', { folder, videoId });
+
+export const redoEdit = (folder: string, videoId: string) =>
+  invoke<EditState>('redo_edit', { folder, videoId });

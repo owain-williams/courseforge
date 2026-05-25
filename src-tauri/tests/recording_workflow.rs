@@ -14,6 +14,7 @@ use courseforge_lib::core::permissions::CaptureSources;
 use courseforge_lib::core::segments;
 use courseforge_lib::recorder::fake::FakeRecorderBackend;
 use courseforge_lib::recording_manager::RecordingManager;
+use courseforge_lib::remuxer::fake::FakeRemuxer;
 
 fn course_with_video() -> (tempfile::TempDir, std::path::PathBuf, String) {
     let root = tempfile::tempdir().unwrap();
@@ -24,7 +25,10 @@ fn course_with_video() -> (tempfile::TempDir, std::path::PathBuf, String) {
 }
 
 fn fresh_manager() -> RecordingManager {
-    RecordingManager::new(Box::new(FakeRecorderBackend::default()))
+    RecordingManager::new(
+        Box::new(FakeRecorderBackend::default()),
+        Box::new(FakeRemuxer::default()),
+    )
 }
 
 #[test]
@@ -36,8 +40,10 @@ fn record_keep_persists_segment_and_survives_relaunch() {
     mgr.stop_session(&snap.id).unwrap();
     let seg = mgr.keep_session(&snap.id).unwrap();
 
-    // The segment file lives where the AC says it should.
-    let on_disk = folder.join("videos").join(&vid).join("segments").join(format!("{}.mkv", seg.id));
+    // The segment file lives where the AC says it should — `.mp4` because
+    // the finalize step remuxes the `.partial.mkv` into a WebKit-playable
+    // container.
+    let on_disk = folder.join("videos").join(&vid).join("segments").join(format!("{}.mp4", seg.id));
     assert!(on_disk.is_file());
 
     // "Relaunch" — a brand-new scan finds the same segment.
@@ -78,8 +84,10 @@ fn crashed_recording_surfaces_as_orphan_and_can_be_imported() {
     assert_eq!(orphans[0].id, orphan_id);
     assert_eq!(orphans[0].video_id, vid);
 
-    // User picks "Import" → it becomes a normal Segment.
-    let seg = segments::finalize_segment(&folder, &vid, &orphan_id).unwrap();
+    // User picks "Import" → it becomes a normal Segment, going through the
+    // same remux step as Keep so the result plays in the WebKit `<video>`.
+    let mgr = fresh_manager();
+    let seg = mgr.adopt_orphan(&folder, &vid, &orphan_id).unwrap();
     assert_eq!(seg.id, orphan_id);
 
     // No longer an orphan.

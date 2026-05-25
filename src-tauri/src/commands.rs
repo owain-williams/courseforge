@@ -2,6 +2,11 @@ use std::path::PathBuf;
 use serde::Serialize;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use crate::core::{config, course, library, CoreError};
+use crate::core::permissions::{
+    self, CaptureSources, PermissionsSnapshot, SettingsPane,
+};
+use crate::core::segments::{self, OrphanSegment, Segment};
+use crate::recording_manager::{RecordingManager, SessionSnapshot};
 use crate::windows::{CourseWindowRegistry, OpenDecision};
 
 #[derive(Debug, Serialize)]
@@ -267,4 +272,129 @@ pub fn get_window_course_folder(
     registry: tauri::State<'_, CourseWindowRegistry>,
 ) -> Option<PathBuf> {
     registry.folder_for_label(window.label())
+}
+
+// ---------------------------------------------------------------------------
+// Recording flow
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn recording_preflight() -> PermissionsSnapshot {
+    let checker = permissions::default_checker();
+    PermissionsSnapshot::capture(checker.as_ref())
+}
+
+/// Deep-link the user to the relevant Privacy & Security pane. We use macOS'
+/// `open` so the system-handler URL is followed by the OS — no Tauri shell
+/// plugin required.
+#[tauri::command]
+pub fn open_settings_pane(pane: SettingsPane) -> Result<(), AppError> {
+    let url = pane.url();
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("/usr/bin/open")
+            .arg(url)
+            .status()
+            .map_err(|e| AppError { message: format!("failed to open settings: {e}") })?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // No-op on non-mac — the UI shouldn't be offering the link there.
+        let _ = url;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn start_recording(
+    manager: tauri::State<'_, RecordingManager>,
+    folder: PathBuf,
+    video_id: String,
+    sources: Option<CaptureSources>,
+) -> Result<SessionSnapshot, AppError> {
+    let sources = sources.unwrap_or_default();
+    Ok(manager.start_session(&folder, &video_id, sources)?)
+}
+
+#[tauri::command]
+pub fn pause_recording(
+    manager: tauri::State<'_, RecordingManager>,
+    session_id: String,
+) -> Result<SessionSnapshot, AppError> {
+    Ok(manager.pause_session(&session_id)?)
+}
+
+#[tauri::command]
+pub fn resume_recording(
+    manager: tauri::State<'_, RecordingManager>,
+    session_id: String,
+) -> Result<SessionSnapshot, AppError> {
+    Ok(manager.resume_session(&session_id)?)
+}
+
+#[tauri::command]
+pub fn stop_recording(
+    manager: tauri::State<'_, RecordingManager>,
+    session_id: String,
+) -> Result<SessionSnapshot, AppError> {
+    Ok(manager.stop_session(&session_id)?)
+}
+
+#[tauri::command]
+pub fn keep_segment(
+    manager: tauri::State<'_, RecordingManager>,
+    session_id: String,
+) -> Result<Segment, AppError> {
+    Ok(manager.keep_session(&session_id)?)
+}
+
+#[tauri::command]
+pub fn discard_segment(
+    manager: tauri::State<'_, RecordingManager>,
+    session_id: String,
+) -> Result<(), AppError> {
+    Ok(manager.discard_session(&session_id)?)
+}
+
+#[tauri::command]
+pub fn list_active_sessions(
+    manager: tauri::State<'_, RecordingManager>,
+) -> Vec<SessionSnapshot> {
+    manager.list_sessions()
+}
+
+#[tauri::command]
+pub fn has_active_recording(manager: tauri::State<'_, RecordingManager>) -> bool {
+    manager.has_active_sessions()
+}
+
+#[tauri::command]
+pub fn list_segments(folder: PathBuf, video_id: String) -> Result<Vec<Segment>, AppError> {
+    Ok(segments::list_segments(&folder, &video_id)?)
+}
+
+#[tauri::command]
+pub fn scan_orphan_segments(folder: PathBuf) -> Result<Vec<OrphanSegment>, AppError> {
+    Ok(segments::scan_orphans(&folder)?)
+}
+
+/// Adopt an orphan `.partial.mkv` as a finished Segment (Keep equivalent for
+/// crash-recovered files).
+#[tauri::command]
+pub fn import_orphan_segment(
+    folder: PathBuf,
+    video_id: String,
+    segment_id: String,
+) -> Result<Segment, AppError> {
+    Ok(segments::finalize_segment(&folder, &video_id, &segment_id)?)
+}
+
+/// Delete an orphan `.partial.mkv` (Discard equivalent for crash-recovered files).
+#[tauri::command]
+pub fn discard_orphan_segment(
+    folder: PathBuf,
+    video_id: String,
+    segment_id: String,
+) -> Result<(), AppError> {
+    Ok(segments::discard_partial(&folder, &video_id, &segment_id)?)
 }

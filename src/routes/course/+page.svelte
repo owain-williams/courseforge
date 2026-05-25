@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { getCurrentWindow } from '@tauri-apps/api/window';
   import {
     getWindowCourseFolder,
     readCourse,
@@ -17,10 +18,29 @@
     reorderWorkflowStates,
     removeWorkflowState,
     setVideoState,
+    recordingPreflight,
+    openSettingsPane,
+    startRecording,
+    pauseRecording,
+    resumeRecording,
+    stopRecording,
+    keepSegment,
+    discardSegment,
+    listActiveSessions,
+    hasActiveRecording,
+    listSegments,
+    scanOrphanSegments,
+    importOrphanSegment,
+    discardOrphanSegment,
     type Course,
     type Module,
     type Video,
-    type WorkflowState
+    type WorkflowState,
+    type PermissionsSnapshot,
+    type SessionSnapshot,
+    type Segment,
+    type OrphanSegment,
+    type CaptureSources
   } from '$lib/api';
 
   let folder = $state<string | null>(null);
@@ -363,7 +383,216 @@
     });
   }
 
+  // ------------------------------------------------------------
+  // Recording state — per-video and per-course (orphans, sessions)
+  // ------------------------------------------------------------
+  let permissions = $state<PermissionsSnapshot | null>(null);
+  let permsBlockingVideoId = $state<string | null>(null); // video that triggered a "perms missing" banner
+  let sessionsByVideo = $state<Record<string, SessionSnapshot>>({});
+  let segmentsByVideo = $state<Record<string, Segment[]>>({});
+  let orphans = $state<OrphanSegment[]>([]);
+  let recordingSources = $state<CaptureSources>({
+    microphone: true,
+    systemAudio: false,
+    webcam: false
+  });
+  // Elapsed-seconds tick so the recording panel timer updates without us
+  // pushing per-session timers from Rust.
+  let nowTick = $state(0);
+  let sessionStartedAt = $state<Record<string, number>>({});
+
+  // The recording panel renders separately to the row; remember which row to
+  // anchor it to.
+  function sessionForVideo(videoId: string): SessionSnapshot | undefined {
+    return sessionsByVideo[videoId];
+  }
+
+  function permissionsSatisfied(p: PermissionsSnapshot | null, s: CaptureSources): boolean {
+    if (!p) return false;
+    if (p.screenRecording !== 'granted') return false;
+    if (s.microphone && p.microphone !== 'granted' && p.microphone !== 'notDetermined') return false;
+    if (s.webcam && p.camera !== 'granted' && p.camera !== 'notDetermined') return false;
+    return true;
+  }
+
+  async function refreshSessions() {
+    try {
+      const list = await listActiveSessions();
+      const next: Record<string, SessionSnapshot> = {};
+      for (const s of list) next[s.videoId] = s;
+      sessionsByVideo = next;
+    } catch (e) {
+      // Non-fatal — session listing is best-effort.
+      console.warn('listActiveSessions failed', e);
+    }
+  }
+
+  async function refreshSegments(videoId: string) {
+    if (!folder) return;
+    try {
+      segmentsByVideo = { ...segmentsByVideo, [videoId]: await listSegments(folder, videoId) };
+    } catch (e) {
+      console.warn('listSegments failed', e);
+    }
+  }
+
+  async function refreshAllSegments() {
+    if (!folder || !course) return;
+    const map: Record<string, Segment[]> = {};
+    await Promise.all(
+      course.videos.map(async (v) => {
+        try {
+          map[v.id] = await listSegments(folder!, v.id);
+        } catch {
+          map[v.id] = [];
+        }
+      })
+    );
+    segmentsByVideo = map;
+  }
+
+  async function refreshOrphans() {
+    if (!folder) return;
+    try {
+      orphans = await scanOrphanSegments(folder);
+    } catch (e) {
+      console.warn('scanOrphans failed', e);
+    }
+  }
+
+  async function refreshPermissions() {
+    try {
+      permissions = await recordingPreflight();
+    } catch (e) {
+      console.warn('preflight failed', e);
+    }
+  }
+
+  async function startRecordingForVideo(videoId: string) {
+    if (!folder) return;
+    await refreshPermissions();
+    if (!permissionsSatisfied(permissions, recordingSources)) {
+      permsBlockingVideoId = videoId;
+      return;
+    }
+    permsBlockingVideoId = null;
+    await withBusy(async () => {
+      const snap = await startRecording(folder!, videoId, recordingSources);
+      sessionsByVideo = { ...sessionsByVideo, [videoId]: snap };
+      sessionStartedAt = { ...sessionStartedAt, [snap.id]: Date.now() };
+    });
+  }
+
+  async function pauseFor(videoId: string) {
+    const s = sessionForVideo(videoId);
+    if (!s) return;
+    await withBusy(async () => {
+      const next = await pauseRecording(s.id);
+      sessionsByVideo = { ...sessionsByVideo, [videoId]: next };
+    });
+  }
+
+  async function resumeFor(videoId: string) {
+    const s = sessionForVideo(videoId);
+    if (!s) return;
+    await withBusy(async () => {
+      const next = await resumeRecording(s.id);
+      sessionsByVideo = { ...sessionsByVideo, [videoId]: next };
+    });
+  }
+
+  async function stopFor(videoId: string) {
+    const s = sessionForVideo(videoId);
+    if (!s) return;
+    await withBusy(async () => {
+      const next = await stopRecording(s.id);
+      sessionsByVideo = { ...sessionsByVideo, [videoId]: next };
+    });
+  }
+
+  async function keepFor(videoId: string) {
+    const s = sessionForVideo(videoId);
+    if (!s) return;
+    await withBusy(async () => {
+      await keepSegment(s.id);
+      const copy = { ...sessionsByVideo };
+      delete copy[videoId];
+      sessionsByVideo = copy;
+      await refreshSegments(videoId);
+    });
+  }
+
+  async function discardFor(videoId: string) {
+    const s = sessionForVideo(videoId);
+    if (!s) return;
+    const activeWarn =
+      s.state === 'recording' || s.state === 'paused'
+        ? 'Discard this in-progress recording? The capture so far will be lost.'
+        : 'Discard this recording? The capture will be deleted.';
+    if (!confirm(activeWarn)) return;
+    await withBusy(async () => {
+      await discardSegment(s.id);
+      const copy = { ...sessionsByVideo };
+      delete copy[videoId];
+      sessionsByVideo = copy;
+    });
+  }
+
+  async function importOrphan(o: OrphanSegment) {
+    if (!folder) return;
+    await withBusy(async () => {
+      await importOrphanSegment(folder!, o.videoId, o.id);
+      await Promise.all([refreshOrphans(), refreshSegments(o.videoId)]);
+    });
+  }
+
+  async function dropOrphan(o: OrphanSegment) {
+    if (!folder) return;
+    if (!confirm('Discard this recovered recording? The file will be deleted.')) return;
+    await withBusy(async () => {
+      await discardOrphanSegment(folder!, o.videoId, o.id);
+      await refreshOrphans();
+    });
+  }
+
+  async function openPane(pane: 'screenRecording' | 'camera' | 'microphone') {
+    try {
+      await openSettingsPane(pane);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  function elapsedSecondsFor(sessionId: string): number {
+    const at = sessionStartedAt[sessionId];
+    if (!at) return 0;
+    // nowTick is referenced so $derived/effects re-evaluate each second.
+    const _ = nowTick;
+    return Math.max(0, Math.floor((Date.now() - at) / 1000));
+  }
+
+  function fmtClock(seconds: number): string {
+    const m = Math.floor(seconds / 60).toString().padStart(2, '0');
+    const s = (seconds % 60).toString().padStart(2, '0');
+    return `${m}:${s}`;
+  }
+
+  function videoTitleForOrphan(o: OrphanSegment): string {
+    return course?.videos.find((v) => v.id === o.videoId)?.title ?? o.videoId;
+  }
+
+  // Per-second tick while any session is in a non-terminal state.
+  $effect(() => {
+    const any = Object.values(sessionsByVideo).some(
+      (s) => s.state === 'recording' || s.state === 'paused'
+    );
+    if (!any) return;
+    const handle = setInterval(() => (nowTick = Date.now()), 1000);
+    return () => clearInterval(handle);
+  });
+
   onMount(() => {
+    let unlistenClose: (() => void) | null = null;
     void (async () => {
       try {
         folder = await getWindowCourseFolder();
@@ -372,10 +601,48 @@
           return;
         }
         await refresh();
+        await Promise.all([
+          refreshPermissions(),
+          refreshSessions(),
+          refreshOrphans(),
+          refreshAllSegments()
+        ]);
+
+        // Close-window guard: while any session is non-terminal, intercept
+        // the close request and ask the user to confirm losing the take.
+        try {
+          const win = getCurrentWindow();
+          const u = await win.onCloseRequested(async (event) => {
+            if (await hasActiveRecording()) {
+              const ok = confirm(
+                'A recording is still in progress. Closing this window will stop and discard it. Continue?'
+              );
+              if (!ok) {
+                event.preventDefault();
+                return;
+              }
+              // User accepted — discard every active session before allowing
+              // the close so we don't leave orphan ffmpegs behind.
+              for (const s of Object.values(sessionsByVideo)) {
+                try {
+                  await discardSegment(s.id);
+                } catch {
+                  /* best effort */
+                }
+              }
+            }
+          });
+          unlistenClose = u;
+        } catch (e) {
+          console.warn('onCloseRequested wiring failed', e);
+        }
       } catch (e) {
         error = String(e);
       }
     })();
+    return () => {
+      if (unlistenClose) unlistenClose();
+    };
   });
 </script>
 
@@ -389,6 +656,94 @@
 
   {#if error}
     <div class="error" role="alert">{error}</div>
+  {/if}
+
+  {#if orphans.length > 0}
+    <section class="orphan-banner" aria-label="Recovered recordings">
+      <h2>Recovered recording{orphans.length === 1 ? '' : 's'}</h2>
+      <p class="hint">
+        {orphans.length === 1
+          ? 'A previous recording session was interrupted.'
+          : `${orphans.length} previous recording sessions were interrupted.`}
+        The captured file{orphans.length === 1 ? '' : 's'} may still be usable.
+      </p>
+      <ul class="orphan-list">
+        {#each orphans as o (`${o.videoId}:${o.id}`)}
+          <li>
+            <div class="orphan-meta">
+              <strong>{videoTitleForOrphan(o)}</strong>
+              <code title={o.path}>{o.path}</code>
+            </div>
+            <div class="actions">
+              <button class="primary" disabled={busy} onclick={() => importOrphan(o)}>
+                Import
+              </button>
+              <button class="ghost" disabled={busy} onclick={() => dropOrphan(o)}>
+                Discard
+              </button>
+            </div>
+          </li>
+        {/each}
+      </ul>
+    </section>
+  {/if}
+
+  {#if permsBlockingVideoId && permissions}
+    {@const p = permissions}
+    <section class="perms-banner" role="alert">
+      <h2>Grant capture permissions to record</h2>
+      <p class="hint">
+        macOS requires you to allow Courseforge access in System Settings before it can capture.
+      </p>
+      <ul class="perms-list">
+        {#if p.screenRecording !== 'granted'}
+          <li>
+            <span class="perm-name">Screen Recording</span>
+            <span class="perm-status status-{p.screenRecording}">{p.screenRecording}</span>
+            <button class="link" onclick={() => openPane('screenRecording')}>
+              Open System Settings
+            </button>
+          </li>
+        {/if}
+        {#if recordingSources.microphone && p.microphone !== 'granted' && p.microphone !== 'notDetermined'}
+          <li>
+            <span class="perm-name">Microphone</span>
+            <span class="perm-status status-{p.microphone}">{p.microphone}</span>
+            <button class="link" onclick={() => openPane('microphone')}>
+              Open System Settings
+            </button>
+          </li>
+        {/if}
+        {#if recordingSources.webcam && p.camera !== 'granted' && p.camera !== 'notDetermined'}
+          <li>
+            <span class="perm-name">Camera</span>
+            <span class="perm-status status-{p.camera}">{p.camera}</span>
+            <button class="link" onclick={() => openPane('camera')}>
+              Open System Settings
+            </button>
+          </li>
+        {/if}
+      </ul>
+      <div class="actions">
+        <button
+          class="primary"
+          disabled={busy}
+          onclick={async () => {
+            const vid = permsBlockingVideoId;
+            await refreshPermissions();
+            if (vid && permissionsSatisfied(permissions, recordingSources)) {
+              permsBlockingVideoId = null;
+              await startRecordingForVideo(vid);
+            }
+          }}
+        >
+          Re-check &amp; Start
+        </button>
+        <button class="ghost" disabled={busy} onclick={() => (permsBlockingVideoId = null)}>
+          Cancel
+        </button>
+      </div>
+    </section>
   {/if}
 
   {#if course}
@@ -533,6 +888,8 @@
               {#each m.videoIds as vid, vi (vid)}
                 {@const v = videoById(vid)}
                 {#if v}
+                  {@const sess = sessionForVideo(v.id)}
+                  {@const segs = segmentsByVideo[v.id] ?? []}
                   <li class="video">
                     <div class="title-area">
                       {#if editing?.kind === 'video' && editing.id === v.id}
@@ -555,8 +912,34 @@
                           {stateById(v.stateId)?.name}
                         </span>
                       {/if}
+                      {#if segs.length > 0}
+                        <span class="segments-badge" title="Recorded segments">
+                          {segs.length} segment{segs.length === 1 ? '' : 's'}
+                        </span>
+                      {/if}
+                      {#if sess && (sess.state === 'recording' || sess.state === 'paused')}
+                        <span
+                          class="rec-badge"
+                          class:paused={sess.state === 'paused'}
+                          title={sess.state}
+                        >
+                          ● {sess.state === 'paused' ? 'PAUSED' : 'REC'}
+                        </span>
+                      {/if}
                     </div>
                     <div class="actions">
+                      {#if !sess}
+                        <button
+                          class="link rec-btn"
+                          disabled={busy || segs.length > 0}
+                          title={segs.length > 0
+                            ? 'This Video already has a Segment — multi-Segment Videos arrive in a later slice.'
+                            : 'Start recording for this Video'}
+                          onclick={() => startRecordingForVideo(v.id)}
+                        >
+                          ● Record
+                        </button>
+                      {/if}
                       <button class="icon" disabled={vi === 0 || busy} onclick={() => moveVideoInModule(m, v, -1)} title="Move up">↑</button>
                       <button class="icon" disabled={vi === m.videoIds.length - 1 || busy} onclick={() => moveVideoInModule(m, v, 1)} title="Move down">↓</button>
                       {#if course.modules.length > 1}
@@ -582,6 +965,51 @@
                       <button class="link danger" disabled={busy} onclick={() => deleteVideoAt(v)}>Delete</button>
                     </div>
                   </li>
+
+                  {#if sess}
+                    <li class="recording-panel" class:awaiting={sess.state === 'awaitingDecision'}>
+                      {#if sess.state === 'recording' || sess.state === 'paused'}
+                        <div class="rec-status">
+                          <span class="rec-dot" class:paused={sess.state === 'paused'}></span>
+                          <span class="rec-timer">{fmtClock(elapsedSecondsFor(sess.id))}</span>
+                          <span class="rec-label">
+                            {sess.state === 'paused' ? 'Paused' : 'Recording…'}
+                          </span>
+                          {#if sess.sources.microphone}<span class="src-chip">Mic</span>{/if}
+                          <span class="src-chip">Screen</span>
+                        </div>
+                        <div class="actions">
+                          {#if sess.state === 'recording'}
+                            <button class="ghost" disabled={busy} onclick={() => pauseFor(v.id)}>
+                              Pause
+                            </button>
+                          {:else}
+                            <button class="ghost" disabled={busy} onclick={() => resumeFor(v.id)}>
+                              Resume
+                            </button>
+                          {/if}
+                          <button class="primary" disabled={busy} onclick={() => stopFor(v.id)}>
+                            Stop
+                          </button>
+                          <button class="link danger" disabled={busy} onclick={() => discardFor(v.id)}>
+                            Discard
+                          </button>
+                        </div>
+                      {:else if sess.state === 'awaitingDecision'}
+                        <div class="rec-status">
+                          <span class="rec-label">Recording finished. Keep this take?</span>
+                        </div>
+                        <div class="actions">
+                          <button class="primary" disabled={busy} onclick={() => keepFor(v.id)}>
+                            Keep
+                          </button>
+                          <button class="ghost" disabled={busy} onclick={() => discardFor(v.id)}>
+                            Discard
+                          </button>
+                        </div>
+                      {/if}
+                    </li>
+                  {/if}
                 {/if}
               {/each}
 
@@ -987,5 +1415,138 @@
     border-radius: 6px;
     margin-bottom: 1rem;
     font-size: 0.85rem;
+  }
+
+  /* Orphan recovery banner */
+  .orphan-banner {
+    background: #fff7e6;
+    border: 1px solid #f3d58b;
+    padding: 0.85rem 1rem;
+    border-radius: 8px;
+    margin-bottom: 1rem;
+  }
+  .orphan-banner h2 { font-size: 0.95rem; margin: 0 0 0.25rem; color: #6c4a00; }
+  .orphan-banner .hint { font-size: 0.8rem; color: #6c4a00; margin: 0 0 0.5rem; }
+  .orphan-banner ul.orphan-list {
+    list-style: none; padding: 0; margin: 0;
+    display: flex; flex-direction: column; gap: 0.4rem;
+  }
+  .orphan-banner ul.orphan-list li {
+    display: flex; justify-content: space-between; align-items: center;
+    background: white; border: 1px solid #f1e2bb; border-radius: 6px;
+    padding: 0.45rem 0.65rem; gap: 0.75rem;
+  }
+  .orphan-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .orphan-meta code {
+    font-family: 'SF Mono', Menlo, monospace; font-size: 0.7rem; color: #777;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 360px;
+  }
+
+  /* Permissions banner */
+  .perms-banner {
+    background: #fff0f0;
+    border: 1px solid #f3b8b8;
+    padding: 0.85rem 1rem;
+    border-radius: 8px;
+    margin-bottom: 1rem;
+  }
+  .perms-banner h2 { font-size: 0.95rem; margin: 0 0 0.25rem; color: #8a1a1a; }
+  .perms-banner .hint { font-size: 0.8rem; color: #8a1a1a; margin: 0 0 0.5rem; }
+  .perms-banner ul.perms-list {
+    list-style: none; padding: 0; margin: 0 0 0.6rem 0;
+    display: flex; flex-direction: column; gap: 0.4rem;
+  }
+  .perms-banner ul.perms-list li {
+    display: grid;
+    grid-template-columns: 9rem auto 1fr;
+    align-items: center;
+    gap: 0.5rem;
+    background: white;
+    border: 1px solid #f3d2d2;
+    border-radius: 6px;
+    padding: 0.4rem 0.6rem;
+  }
+  .perm-name { font-weight: 600; font-size: 0.85rem; }
+  .perm-status {
+    display: inline-block; padding: 1px 7px; border-radius: 10px;
+    font-size: 0.7rem; text-transform: uppercase;
+    background: #f4f4f4; color: #555;
+  }
+  .perm-status.status-denied { background: #ffe5e5; color: #8a1a1a; }
+  .perm-status.status-notDetermined { background: #fff7e6; color: #6c4a00; }
+  .perm-status.status-restricted { background: #eee; color: #555; }
+
+  /* Per-Video recording bits */
+  .segments-badge {
+    display: inline-block;
+    margin-left: 0.4rem;
+    padding: 1px 7px;
+    font-size: 0.7rem;
+    color: #2c5b1a;
+    background: #e6f6df;
+    border: 1px solid #c4e3b6;
+    border-radius: 10px;
+  }
+  .rec-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    margin-left: 0.4rem;
+    padding: 1px 7px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: #b00020;
+    background: #ffe5e5;
+    border: 1px solid #f3b8b8;
+    border-radius: 10px;
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  .rec-badge.paused {
+    color: #6c4a00; background: #fff7e6; border-color: #f3d58b;
+    animation: none;
+  }
+  button.rec-btn {
+    color: #b00020;
+    font-weight: 600;
+  }
+  button.rec-btn:disabled { color: #888; }
+
+  /* Recording panel under a video row */
+  li.recording-panel {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.6rem 1rem;
+    background: #fff7f7;
+    border-top: 1px solid #f3d2d2;
+    border-bottom: 1px solid #f3d2d2;
+  }
+  li.recording-panel.awaiting {
+    background: #f3f7ff; border-color: #c8d9f5;
+  }
+  .rec-status {
+    display: flex; align-items: center; gap: 0.5rem; flex: 1;
+  }
+  .rec-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #d62a2a;
+    box-shadow: 0 0 0 0 rgba(214, 42, 42, 0.6);
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  .rec-dot.paused { background: #c79a2c; animation: none; }
+  .rec-timer {
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 0.95rem;
+    color: #333;
+    min-width: 56px;
+  }
+  .rec-label { font-size: 0.85rem; color: #555; }
+  .src-chip {
+    display: inline-block; padding: 1px 7px; font-size: 0.7rem;
+    color: #555; background: #eef0f3; border: 1px solid #d8dadd;
+    border-radius: 10px;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%      { opacity: 0.55; transform: scale(0.85); }
   }
 </style>

@@ -129,3 +129,98 @@ export const pickExistingCourseFolder = async () => {
   });
   return typeof result === 'string' ? result : null;
 };
+
+// ---------------------------------------------------------------------------
+// Recording
+// ---------------------------------------------------------------------------
+
+export type PermissionStatus = 'granted' | 'denied' | 'notDetermined' | 'restricted';
+
+export type PermissionsSnapshot = {
+  screenRecording: PermissionStatus;
+  camera: PermissionStatus;
+  microphone: PermissionStatus;
+};
+
+export type SettingsPane = 'screenRecording' | 'camera' | 'microphone';
+
+export type CaptureSources = {
+  microphone: boolean;
+  systemAudio: boolean;
+  webcam: boolean;
+};
+
+export type SessionState =
+  | 'idle'
+  | 'recording'
+  | 'paused'
+  | 'awaitingDecision'
+  | 'persisted'
+  | 'discarded';
+
+export type SessionSnapshot = {
+  id: string;
+  videoId: string;
+  segmentId: string;
+  courseFolder: string;
+  state: SessionState;
+  sources: CaptureSources;
+};
+
+export type Segment = {
+  id: string;
+  videoId: string;
+  path: string;
+};
+
+export type OrphanSegment = Segment;
+
+export const recordingPreflight = () =>
+  invoke<PermissionsSnapshot>('recording_preflight');
+
+export const openSettingsPane = (pane: SettingsPane) =>
+  invoke<void>('open_settings_pane', { pane });
+
+export const startRecording = (
+  folder: string,
+  videoId: string,
+  sources?: CaptureSources
+) =>
+  invoke<SessionSnapshot>('start_recording', {
+    folder,
+    videoId,
+    sources: sources ?? null
+  });
+
+export const pauseRecording = (sessionId: string) =>
+  invoke<SessionSnapshot>('pause_recording', { sessionId });
+
+export const resumeRecording = (sessionId: string) =>
+  invoke<SessionSnapshot>('resume_recording', { sessionId });
+
+export const stopRecording = (sessionId: string) =>
+  invoke<SessionSnapshot>('stop_recording', { sessionId });
+
+export const keepSegment = (sessionId: string) =>
+  invoke<Segment>('keep_segment', { sessionId });
+
+export const discardSegment = (sessionId: string) =>
+  invoke<void>('discard_segment', { sessionId });
+
+export const listActiveSessions = () =>
+  invoke<SessionSnapshot[]>('list_active_sessions');
+
+export const hasActiveRecording = () =>
+  invoke<boolean>('has_active_recording');
+
+export const listSegments = (folder: string, videoId: string) =>
+  invoke<Segment[]>('list_segments', { folder, videoId });
+
+export const scanOrphanSegments = (folder: string) =>
+  invoke<OrphanSegment[]>('scan_orphan_segments', { folder });
+
+export const importOrphanSegment = (folder: string, videoId: string, segmentId: string) =>
+  invoke<Segment>('import_orphan_segment', { folder, videoId, segmentId });
+
+export const discardOrphanSegment = (folder: string, videoId: string, segmentId: string) =>
+  invoke<void>('discard_orphan_segment', { folder, videoId, segmentId });

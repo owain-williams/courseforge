@@ -40,6 +40,18 @@ pub enum CoreError {
 
     #[error("failed to move {path} to Trash: {message}")]
     Trash { path: PathBuf, message: String },
+
+    #[error("segment not found: {0}")]
+    SegmentNotFound(String),
+
+    #[error("recording session not found: {0}")]
+    SessionNotFound(String),
+
+    #[error("cannot {action} a session in state {state}")]
+    InvalidSessionTransition { action: String, state: String },
+
+    #[error("recorder backend failed: {0}")]
+    Recorder(String),
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

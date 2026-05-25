@@ -102,7 +102,16 @@ impl RecorderBackend for FfmpegMacBackend {
             "-f", "avfoundation",
             "-capture_cursor", "1",
             "-framerate", "30",
-            "-pixel_format", "uyvy422",
+            // No `-pixel_format` for the input: forcing one (e.g. `uyvy422`)
+            // makes avfoundation refuse the configuration on Retina displays
+            // because the requested format × resolution × framerate exceeds
+            // what the screen capture device can deliver. The symptom was
+            // "Configuration of video device failed, falling back to
+            // default" plus an ffmpeg that ran forever without writing any
+            // frames to the output file. Letting avfoundation negotiate its
+            // native format (nv12 / uyvy422 depending on hardware) and
+            // letting swscale convert to `-pix_fmt yuv420p` for libx264
+            // works on every Mac we've tested.
             "-i", &device_arg,
             "-c:v", "libx264",
             "-preset", "ultrafast",

@@ -1,6 +1,28 @@
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 
+/**
+ * Render any thrown value as a user-facing string. Tauri commands reject
+ * with an `AppError` (`{ message: string }`), which `String(e)` would
+ * render as the useless literal "[object Object]"; this pulls `.message`
+ * out and falls back to sensible defaults for plain Errors, strings, etc.
+ */
+export function formatError(e: unknown): string {
+  if (e == null) return 'Unknown error';
+  if (typeof e === 'string') return e;
+  if (e instanceof Error) return e.message;
+  if (typeof e === 'object') {
+    const maybeMessage = (e as { message?: unknown }).message;
+    if (typeof maybeMessage === 'string') return maybeMessage;
+    try {
+      return JSON.stringify(e);
+    } catch {
+      return String(e);
+    }
+  }
+  return String(e);
+}
+
 export type AppConfig = {
   scannedRoot: string | null;
   pinnedFolders: string[];

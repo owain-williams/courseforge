@@ -14,7 +14,8 @@
     addExistingCourse,
     removeFromLibrary,
     moveCourseToTrash,
-    type CourseEntry
+    type CourseEntry,
+    formatError
   } from '$lib/api';
 
   let scannedRoot = $state<string | null>(null);
@@ -48,7 +49,7 @@
     try {
       entries = await listLibrary();
     } catch (e) {
-      error = String(e);
+      error = formatError(e);
     }
   }
 
@@ -61,7 +62,7 @@
       scannedRoot = picked;
       await refresh();
     } catch (e) {
-      error = String(e);
+      error = formatError(e);
     }
   }
 
@@ -74,7 +75,7 @@
       await addExistingCourse(picked);
       await refresh();
     } catch (e) {
-      error = String(e);
+      error = formatError(e);
     } finally {
       busy = false;
     }
@@ -105,7 +106,7 @@
       newCourseDraft = '';
       await refresh();
     } catch (e) {
-      error = String(e);
+      error = formatError(e);
     } finally {
       busy = false;
     }
@@ -122,7 +123,7 @@
     try {
       await openCourseWindow(entry.folder);
     } catch (e) {
-      error = String(e);
+      error = formatError(e);
     }
   }
 
@@ -138,7 +139,7 @@
       await renameCourse(entry.folder, next);
       await refresh();
     } catch (e) {
-      error = String(e);
+      error = formatError(e);
     } finally {
       busy = false;
       renamingFolder = null;
@@ -152,7 +153,7 @@
       await removeFromLibrary(entry.folder);
       await refresh();
     } catch (e) {
-      error = String(e);
+      error = formatError(e);
     } finally {
       busy = false;
     }
@@ -166,7 +167,7 @@
       confirmingFolder = null;
       await refresh();
     } catch (e) {
-      error = String(e);
+      error = formatError(e);
     } finally {
       busy = false;
     }
@@ -180,7 +181,7 @@
       confirmingFolder = null;
       await refresh();
     } catch (e) {
-      error = String(e);
+      error = formatError(e);
     } finally {
       busy = false;
     }
@@ -201,7 +202,7 @@
         scannedRoot = cfg.scannedRoot;
         await refresh();
       } catch (e) {
-        error = String(e);
+        error = formatError(e);
       }
 
       const win = getCurrentWindow();

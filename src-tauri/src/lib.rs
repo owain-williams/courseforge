@@ -2,6 +2,8 @@ pub mod core;
 mod commands;
 pub mod recorder;
 pub mod recording_manager;
+pub mod transcriber;
+pub mod transcription_manager;
 mod windows;
 
 pub fn run() {
@@ -9,6 +11,33 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(windows::CourseWindowRegistry::default())
         .manage(recording_manager::RecordingManager::new(recorder::default_backend()))
+        .manage(transcription_manager::TranscriptionManager::new(
+            transcriber::default_backend(),
+        ))
+        .setup(|app| {
+            use tauri::{Emitter, Manager};
+            // Bridge the manager's subscriber to a Tauri event so the
+            // frontend can react. The worker thread drives `process_pending`
+            // whenever the queue might have work.
+            let handle = app.handle().clone();
+            {
+                let mgr = app.state::<transcription_manager::TranscriptionManager>();
+                mgr.set_subscriber(Box::new(move |job| {
+                    let _ = handle.emit("transcription-job", job);
+                }));
+            }
+
+            let app_handle = app.handle().clone();
+            std::thread::spawn(move || loop {
+                let state =
+                    app_handle.state::<transcription_manager::TranscriptionManager>();
+                let n = state.process_pending();
+                if n == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
             commands::set_scanned_root,
@@ -51,6 +80,9 @@ pub fn run() {
             commands::scan_orphan_segments,
             commands::import_orphan_segment,
             commands::discard_orphan_segment,
+            commands::list_transcription_jobs,
+            commands::retry_transcription,
+            commands::get_transcript,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

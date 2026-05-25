@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { convertFileSrc } from '@tauri-apps/api/core';
+  import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import {
     getWindowCourseFolder,
     readCourse,
@@ -32,6 +34,9 @@
     scanOrphanSegments,
     importOrphanSegment,
     discardOrphanSegment,
+    listTranscriptionJobs,
+    retryTranscription,
+    getTranscript,
     type Course,
     type Module,
     type Video,
@@ -40,7 +45,9 @@
     type SessionSnapshot,
     type Segment,
     type OrphanSegment,
-    type CaptureSources
+    type CaptureSources,
+    type Transcript,
+    type TranscriptionJob
   } from '$lib/api';
 
   let folder = $state<string | null>(null);
@@ -591,8 +598,115 @@
     return () => clearInterval(handle);
   });
 
+  // ------------------------------------------------------------
+  // Transcription state — per-video jobs + the open video panel
+  // ------------------------------------------------------------
+  let jobsByVideo = $state<Record<string, TranscriptionJob>>({});
+  let transcriptByVideo = $state<Record<string, Transcript | null>>({});
+  let openVideoId = $state<string | null>(null);
+  let videoEl = $state<HTMLVideoElement | null>(null);
+  let activeWordIndex = $state<number>(-1);
+
+  async function refreshJobs() {
+    try {
+      const list = await listTranscriptionJobs();
+      const next: Record<string, TranscriptionJob> = {};
+      for (const j of list) next[j.videoId] = j;
+      jobsByVideo = next;
+    } catch (e) {
+      console.warn('listTranscriptionJobs failed', e);
+    }
+  }
+
+  async function loadTranscript(videoId: string) {
+    if (!folder) return;
+    try {
+      const t = await getTranscript(folder, videoId);
+      transcriptByVideo = { ...transcriptByVideo, [videoId]: t };
+    } catch (e) {
+      console.warn('getTranscript failed', e);
+    }
+  }
+
+  function applyJob(job: TranscriptionJob) {
+    jobsByVideo = { ...jobsByVideo, [job.videoId]: job };
+    if (job.status.kind === 'done') {
+      // Transcript file just landed — pull it in so the open panel can render.
+      void loadTranscript(job.videoId);
+      // Also refresh segments in case Keep just transitioned us here.
+      void refreshSegments(job.videoId);
+    }
+  }
+
+  async function retryFor(videoId: string) {
+    try {
+      await retryTranscription(videoId);
+      await refreshJobs();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function toggleVideoPanel(videoId: string) {
+    if (openVideoId === videoId) {
+      openVideoId = null;
+      activeWordIndex = -1;
+      return;
+    }
+    openVideoId = videoId;
+    activeWordIndex = -1;
+    if (!(videoId in transcriptByVideo)) {
+      await loadTranscript(videoId);
+    }
+  }
+
+  function firstSegmentSrc(videoId: string): string | null {
+    if (!folder) return null;
+    const segs = segmentsByVideo[videoId] ?? [];
+    if (segs.length === 0) return null;
+    // segs[0].path is relative to the Course Folder — join then convert.
+    const abs = `${folder}/${segs[0].path}`;
+    return convertFileSrc(abs);
+  }
+
+  function onTimeUpdate(t: Transcript | null | undefined) {
+    if (!t || !videoEl) return;
+    const now = videoEl.currentTime;
+    // Linear scan is fine for typical Video lengths; binary search if we ever
+    // care about 30-minute talks with thousands of words.
+    let idx = -1;
+    for (let i = 0; i < t.words.length; i++) {
+      if (now >= t.words[i].start && now < t.words[i].end) {
+        idx = i;
+        break;
+      }
+    }
+    if (idx !== activeWordIndex) activeWordIndex = idx;
+  }
+
+  function jumpToWord(w: { start: number }) {
+    if (!videoEl) return;
+    videoEl.currentTime = w.start;
+    void videoEl.play();
+  }
+
+  function jobLabel(job: TranscriptionJob | undefined): string | null {
+    if (!job) return null;
+    switch (job.status.kind) {
+      case 'pending':
+        return 'Transcribing…';
+      case 'running':
+        return `Transcribing ${Math.round(job.status.fraction * 100)}%`;
+      case 'failed':
+        return 'Transcription failed';
+      case 'done':
+        return 'Transcribed';
+    }
+  }
+
   onMount(() => {
     let unlistenClose: (() => void) | null = null;
+    let unlistenJob: UnlistenFn | null = null;
     void (async () => {
       try {
         folder = await getWindowCourseFolder();
@@ -605,8 +719,19 @@
           refreshPermissions(),
           refreshSessions(),
           refreshOrphans(),
-          refreshAllSegments()
+          refreshAllSegments(),
+          refreshJobs()
         ]);
+
+        // Push updates from the transcription worker keep the per-Video
+        // status badges live without polling.
+        try {
+          unlistenJob = await listen<TranscriptionJob>('transcription-job', (e) => {
+            applyJob(e.payload);
+          });
+        } catch (e) {
+          console.warn('transcription-job listener wiring failed', e);
+        }
 
         // Close-window guard: while any session is non-terminal, intercept
         // the close request and ask the user to confirm losing the take.
@@ -642,6 +767,7 @@
     })();
     return () => {
       if (unlistenClose) unlistenClose();
+      if (unlistenJob) unlistenJob();
     };
   });
 </script>
@@ -917,6 +1043,18 @@
                           {segs.length} segment{segs.length === 1 ? '' : 's'}
                         </span>
                       {/if}
+                      {#if jobLabel(jobsByVideo[v.id])}
+                        {@const job = jobsByVideo[v.id]}
+                        <span
+                          class="trx-badge"
+                          class:running={job?.status.kind === 'running' || job?.status.kind === 'pending'}
+                          class:failed={job?.status.kind === 'failed'}
+                          class:done={job?.status.kind === 'done'}
+                          title={job?.status.kind === 'failed' ? job.status.message : ''}
+                        >
+                          {jobLabel(job)}
+                        </span>
+                      {/if}
                       {#if sess && (sess.state === 'recording' || sess.state === 'paused')}
                         <span
                           class="rec-badge"
@@ -938,6 +1076,26 @@
                           onclick={() => startRecordingForVideo(v.id)}
                         >
                           ● Record
+                        </button>
+                      {/if}
+                      {#if segs.length > 0}
+                        <button
+                          class="link"
+                          onclick={() => toggleVideoPanel(v.id)}
+                          title="Watch with transcript"
+                        >
+                          {openVideoId === v.id ? 'Hide' : 'Watch'}
+                        </button>
+                      {/if}
+                      {#if jobsByVideo[v.id]?.status.kind === 'failed'}
+                        <button
+                          class="link"
+                          onclick={() => retryFor(v.id)}
+                          title={jobsByVideo[v.id]?.status.kind === 'failed'
+                            ? (jobsByVideo[v.id]!.status as { message: string }).message
+                            : ''}
+                        >
+                          Retry transcription
                         </button>
                       {/if}
                       <button class="icon" disabled={vi === 0 || busy} onclick={() => moveVideoInModule(m, v, -1)} title="Move up">↑</button>
@@ -1008,6 +1166,71 @@
                           </button>
                         </div>
                       {/if}
+                    </li>
+                  {/if}
+
+                  {#if openVideoId === v.id && segs.length > 0}
+                    {@const src = firstSegmentSrc(v.id)}
+                    {@const t = transcriptByVideo[v.id]}
+                    {@const job = jobsByVideo[v.id]}
+                    <li class="video-panel">
+                      <div class="player-col">
+                        {#if src}
+                          <!-- svelte-ignore a11y_media_has_caption -->
+                          <video
+                            bind:this={videoEl}
+                            class="video-player"
+                            src={src}
+                            controls
+                            preload="metadata"
+                            ontimeupdate={() => onTimeUpdate(t)}
+                          ></video>
+                        {:else}
+                          <div class="player-empty">No recorded Segment to play.</div>
+                        {/if}
+                      </div>
+                      <div class="transcript-col">
+                        {#if job && (job.status.kind === 'pending' || job.status.kind === 'running')}
+                          <div class="transcript-status">
+                            <span>{jobLabel(job)}</span>
+                            {#if job.status.kind === 'running'}
+                              <div
+                                class="progress"
+                                role="progressbar"
+                                aria-valuenow={Math.round(job.status.fraction * 100)}
+                                aria-valuemin="0"
+                                aria-valuemax="100"
+                              >
+                                <div class="progress-fill" style="width: {Math.round(job.status.fraction * 100)}%"></div>
+                              </div>
+                            {/if}
+                          </div>
+                        {:else if job && job.status.kind === 'failed'}
+                          <div class="transcript-status failed">
+                            <span>Transcription failed: {job.status.message}</span>
+                            <button class="link" onclick={() => retryFor(v.id)}>Retry</button>
+                          </div>
+                        {:else if t && t.words.length > 0}
+                          <p class="transcript-words" aria-label="Transcript">
+                            {#each t.words as w, i (i)}
+                              <button
+                                class="word"
+                                class:active={activeWordIndex === i}
+                                onclick={() => jumpToWord(w)}
+                                title={`${w.start.toFixed(2)}s`}
+                              >{w.text}</button>
+                            {/each}
+                          </p>
+                        {:else if t}
+                          <div class="transcript-status">
+                            <span>Transcript is empty.</span>
+                          </div>
+                        {:else}
+                          <div class="transcript-status">
+                            <span>No transcript yet.</span>
+                          </div>
+                        {/if}
+                      </div>
                     </li>
                   {/if}
                 {/if}
@@ -1548,5 +1771,86 @@
   @keyframes pulse {
     0%, 100% { opacity: 1; transform: scale(1); }
     50%      { opacity: 0.55; transform: scale(0.85); }
+  }
+
+  /* Transcription badge */
+  .trx-badge {
+    display: inline-block;
+    margin-left: 0.4rem;
+    padding: 1px 7px;
+    font-size: 0.7rem;
+    border-radius: 10px;
+    background: #eef0f3;
+    border: 1px solid #d8dadd;
+    color: #555;
+    white-space: nowrap;
+  }
+  .trx-badge.running { background: #fff6d9; border-color: #f3d58b; color: #6c4a00; }
+  .trx-badge.failed { background: #ffe5e5; border-color: #f3b8b8; color: #8a1a1a; }
+  .trx-badge.done { background: #e6f6df; border-color: #c4e3b6; color: #2c5b1a; }
+
+  /* Video panel: player + transcript side by side */
+  li.video-panel {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+    gap: 1rem;
+    padding: 0.75rem 1rem 1rem 1rem;
+    background: #f8fafd;
+    border-top: 1px solid #e3e5e8;
+    border-bottom: 1px solid #e3e5e8;
+  }
+  .player-col { min-width: 0; }
+  .transcript-col { min-width: 0; max-height: 320px; overflow-y: auto; }
+  .video-player {
+    width: 100%;
+    max-height: 320px;
+    background: black;
+    border-radius: 6px;
+  }
+  .player-empty {
+    background: #eee; padding: 2rem; text-align: center; border-radius: 6px; color: #777;
+  }
+  .transcript-status {
+    background: white;
+    border: 1px solid #d8dadd;
+    border-radius: 6px;
+    padding: 0.6rem 0.75rem;
+    font-size: 0.85rem;
+    color: #555;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+  .transcript-status.failed { background: #fff0f0; border-color: #f3b8b8; color: #8a1a1a; }
+  .progress {
+    width: 100%; height: 6px; background: #eee; border-radius: 3px; overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%; background: #0066ff; transition: width 120ms linear;
+  }
+  .transcript-words {
+    margin: 0;
+    background: white;
+    border: 1px solid #d8dadd;
+    border-radius: 6px;
+    padding: 0.6rem 0.75rem;
+    line-height: 1.6;
+    color: #333;
+    font-size: 0.92rem;
+  }
+  .word {
+    background: none;
+    border: none;
+    padding: 1px 2px;
+    margin: 0;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+    border-radius: 3px;
+  }
+  .word:hover { background: #eef2ff; }
+  .word.active {
+    background: #0066ff;
+    color: white;
   }
 </style>

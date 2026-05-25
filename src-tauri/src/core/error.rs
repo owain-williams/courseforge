@@ -17,6 +17,13 @@ pub enum CoreError {
         source: serde_json::Error,
     },
 
+    #[error("invalid transcript.json at {path}: {source}")]
+    InvalidTranscriptJson {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
     #[error("title cannot be empty")]
     EmptyTitle,
 
@@ -52,6 +59,15 @@ pub enum CoreError {
 
     #[error("recorder backend failed: {0}")]
     Recorder(String),
+
+    #[error("transcriber backend failed: {0}")]
+    Transcriber(String),
+
+    #[error("no segments available to transcribe for video: {0}")]
+    NoSegmentsForTranscription(String),
+
+    #[error("transcription job not found: {0}")]
+    TranscriptionJobNotFound(String),
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

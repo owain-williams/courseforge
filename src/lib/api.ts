@@ -224,3 +224,37 @@ export const importOrphanSegment = (folder: string, videoId: string, segmentId: 
 
 export const discardOrphanSegment = (folder: string, videoId: string, segmentId: string) =>
   invoke<void>('discard_orphan_segment', { folder, videoId, segmentId });
+
+// ---------------------------------------------------------------------------
+// Transcription
+// ---------------------------------------------------------------------------
+
+export type Word = { start: number; end: number; text: string };
+
+export type Transcript = {
+  schemaVersion: number;
+  videoId: string;
+  segmentIds: string[];
+  words: Word[];
+};
+
+export type JobStatus =
+  | { kind: 'pending' }
+  | { kind: 'running'; fraction: number }
+  | { kind: 'done' }
+  | { kind: 'failed'; message: string };
+
+export type TranscriptionJob = {
+  videoId: string;
+  courseFolder: string;
+  status: JobStatus;
+};
+
+export const listTranscriptionJobs = () =>
+  invoke<TranscriptionJob[]>('list_transcription_jobs');
+
+export const retryTranscription = (videoId: string) =>
+  invoke<void>('retry_transcription', { videoId });
+
+export const getTranscript = (folder: string, videoId: string) =>
+  invoke<Transcript | null>('get_transcript', { folder, videoId });

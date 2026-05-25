@@ -241,6 +241,7 @@ mod tests {
     use crate::core::transcript::Word;
     use crate::recorder::fake::FakeRecorderBackend;
     use crate::recording_manager::RecordingManager;
+    use crate::remuxer::fake::FakeRemuxer;
     use crate::transcriber::fake::{FakeTranscriberBackend, ScriptedResponse};
 
     fn make_manager() -> (TranscriptionManager, Arc<FakeTranscriberBackend>) {
@@ -261,7 +262,10 @@ mod tests {
 
         // Drive a real (fake-backed) recording through to a finalised Segment
         // so the transcription queue has a real Segment to find on disk.
-        let rec_mgr = RecordingManager::new(Box::new(FakeRecorderBackend::default()));
+        let rec_mgr = RecordingManager::new(
+            Box::new(FakeRecorderBackend::default()),
+            Box::new(FakeRemuxer::default()),
+        );
         let snap = rec_mgr
             .start_session(&folder, &v.id, Default::default())
             .unwrap();
@@ -329,8 +333,8 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("mkv"))
-            .expect("a finalised .mkv should exist");
+            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("mp4"))
+            .expect("a finalised .mp4 should exist");
         backend.script(&seg_path, ScriptedResponse::Err("ASR exploded".into()));
 
         mgr.enqueue(folder.clone(), vid.clone());
@@ -353,7 +357,7 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("mkv"))
+            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("mp4"))
             .unwrap();
         backend.script(&seg_path, ScriptedResponse::Err("nope".into()));
 

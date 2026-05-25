@@ -2,6 +2,7 @@ pub mod core;
 mod commands;
 pub mod recorder;
 pub mod recording_manager;
+pub mod remuxer;
 pub mod transcriber;
 pub mod transcription_manager;
 mod windows;
@@ -10,7 +11,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(windows::CourseWindowRegistry::default())
-        .manage(recording_manager::RecordingManager::new(recorder::default_backend()))
+        .manage(recording_manager::RecordingManager::new(
+            recorder::default_backend(),
+            remuxer::default_remuxer(),
+        ))
         .manage(transcription_manager::TranscriptionManager::new(
             transcriber::default_backend(),
         ))

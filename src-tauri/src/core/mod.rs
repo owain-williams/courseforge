@@ -2,6 +2,7 @@ pub mod config;
 pub mod course;
 pub mod edits;
 pub mod error;
+pub mod export;
 pub mod library;
 pub mod permissions;
 pub mod recording;

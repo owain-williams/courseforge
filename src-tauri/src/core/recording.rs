@@ -1,12 +1,12 @@
 //! The recording lifecycle as a pure state machine.
 //!
-//! A `RecordingSession` is the user-facing handle for one capture attempt
-//! against one Video slot. It only models *what state the session is in*;
-//! the actual byte-pushing to `.partial.mkv` lives behind the `Recorder`
-//! trait and the orchestrating manager that owns it.
+//! A `RecordingSession` is the user-facing handle for one Take against one
+//! Video slot. It only models *what state the session is in*; the actual
+//! byte-pushing to `.partial.mov` lives behind the `Recorder` trait and the
+//! orchestrating manager that owns it.
 //!
 //! Keeping the state machine pure means we can exhaustively unit-test every
-//! legal and illegal transition without spinning up ffmpeg or asking the OS
+//! legal and illegal transition without spinning up SCK or asking the OS
 //! for screen-recording permission.
 //!
 //! ```text
@@ -22,11 +22,16 @@
 //!
 //! `Persisted` and `Discarded` are terminal: a session is single-use, and any
 //! subsequent recording is a fresh session with its own id.
+//!
+//! Per ADR-0002 the session carries the `Vec<CaptureRequest>` for the Take
+//! and the `take_id` that links the per-Segment sidecars together. Phase 1
+//! exercises this with one or two requests (screen + optional mic into a
+//! single `.mov`); Phase 2 grows to N writers.
 
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use crate::core::capture::CaptureRequest;
 use crate::core::error::{CoreError, Result};
-use crate::core::permissions::CaptureSources;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,20 +57,23 @@ impl SessionState {
     }
 }
 
-/// One recording attempt. Lives in memory while the user is capturing; once
-/// in a terminal state it's safe to drop. The `partial_path` is allocated
-/// up front by [`crate::core::segments::prepare_segment_path`] so the
-/// recorder backend always has a destination to write to.
+/// One Take. Lives in memory while the user is capturing; once in a terminal
+/// state it's safe to drop. The `partial_path` is allocated up front by
+/// [`crate::core::segments::prepare_segment_path`] so the recorder backend
+/// always has a destination to write to. `recorded_at` is captured at Start
+/// time so the per-Segment sidecar (written on Keep) carries an honest
+/// "when did this Take begin" rather than the Keep-decision timestamp.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RecordingSession {
     pub id: String,
-    #[serde(rename = "videoId")]
     pub video_id: String,
-    #[serde(rename = "segmentId")]
     pub segment_id: String,
-    #[serde(rename = "partialPath")]
     pub partial_path: PathBuf,
-    pub sources: CaptureSources,
+    pub take_id: String,
+    pub requests: Vec<CaptureRequest>,
+    /// ISO-8601 UTC timestamp the Take started.
+    pub recorded_at: String,
     pub state: SessionState,
 }
 
@@ -74,14 +82,18 @@ impl RecordingSession {
         video_id: String,
         segment_id: String,
         partial_path: PathBuf,
-        sources: CaptureSources,
+        take_id: String,
+        requests: Vec<CaptureRequest>,
+        recorded_at: String,
     ) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             video_id,
             segment_id,
             partial_path,
-            sources,
+            take_id,
+            requests,
+            recorded_at,
             state: SessionState::Idle,
         }
     }
@@ -157,13 +169,27 @@ impl RecordingSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::capture::{CompositionDefaults, Device, SourceRole};
+
+    fn screen_request() -> CaptureRequest {
+        CaptureRequest {
+            role: SourceRole::Screen,
+            device: Device {
+                id: "default".into(),
+                label: "Main Display".into(),
+            },
+            defaults: CompositionDefaults::default(),
+        }
+    }
 
     fn session() -> RecordingSession {
         RecordingSession::new(
             "vid-1".into(),
             "seg-1".into(),
-            PathBuf::from("/tmp/seg-1.partial.mkv"),
-            CaptureSources::default(),
+            PathBuf::from("/tmp/seg-1.partial.mov"),
+            "take-1".into(),
+            vec![screen_request()],
+            "2026-05-26T12:00:00Z".into(),
         )
     }
 
@@ -173,8 +199,10 @@ mod tests {
         assert_eq!(s.state, SessionState::Idle);
         assert_eq!(s.video_id, "vid-1");
         assert_eq!(s.segment_id, "seg-1");
+        assert_eq!(s.take_id, "take-1");
+        assert_eq!(s.requests, vec![screen_request()]);
         assert!(!s.id.is_empty());
-        assert_eq!(s.partial_path, PathBuf::from("/tmp/seg-1.partial.mkv"));
+        assert_eq!(s.partial_path, PathBuf::from("/tmp/seg-1.partial.mov"));
     }
 
     #[test]

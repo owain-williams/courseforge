@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::core::capture::{CaptureRequest, SourceRole};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Permission {
@@ -58,38 +60,25 @@ impl PermissionsSnapshot {
         }
     }
 
-    /// True iff every permission required for the requested sources is granted.
-    /// Screen recording is always required (v1 always captures the display);
-    /// mic / camera only if the user enabled them.
-    pub fn satisfies(&self, sources: &CaptureSources) -> bool {
-        if !self.screen_recording.is_granted() {
-            return false;
-        }
-        if sources.microphone && !self.microphone.is_granted() {
-            return false;
-        }
-        if sources.webcam && !self.camera.is_granted() {
-            return false;
-        }
-        true
+    /// True iff every permission required by the supplied capture requests
+    /// is granted. Each [`SourceRole`] maps to the OS-level permission it
+    /// needs; a request whose permission is missing means we must hard-fail
+    /// the Take Start so no source spins up only to fail silently halfway.
+    pub fn satisfies_requests(&self, requests: &[CaptureRequest]) -> bool {
+        requests.iter().all(|r| self.status_for(r.role).is_granted())
     }
-}
 
-/// What the user asked to capture for a session. v1 always captures the main
-/// display; mic / webcam / system-audio are opt-in. System audio and webcam
-/// are wired through the type but not yet implemented end-to-end (deferred).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CaptureSources {
-    pub microphone: bool,
-    #[serde(rename = "systemAudio", default)]
-    pub system_audio: bool,
-    #[serde(default)]
-    pub webcam: bool,
-}
-
-impl Default for CaptureSources {
-    fn default() -> Self {
-        Self { microphone: true, system_audio: false, webcam: false }
+    /// Which permission this snapshot reports for a given role. `Window`
+    /// and `SystemAudio` ride on Screen Recording (they're SCK content);
+    /// `Camera` and `Microphone` are their own TCC slots.
+    pub fn status_for(&self, role: SourceRole) -> PermissionStatus {
+        match role {
+            SourceRole::Screen | SourceRole::Window | SourceRole::SystemAudio => {
+                self.screen_recording
+            }
+            SourceRole::Camera => self.camera,
+            SourceRole::Microphone => self.microphone,
+        }
     }
 }
 
@@ -258,43 +247,67 @@ mod tests {
         assert_eq!(snap.microphone, PermissionStatus::NotDetermined);
     }
 
+    fn req(role: SourceRole) -> CaptureRequest {
+        use crate::core::capture::{CompositionDefaults, Device};
+        CaptureRequest {
+            role,
+            device: Device { id: "default".into(), label: "Default".into() },
+            defaults: CompositionDefaults::default(),
+        }
+    }
+
     #[test]
-    fn satisfies_requires_screen_recording_unconditionally() {
+    fn satisfies_requests_demands_screen_recording_for_screen_role() {
         let snap = PermissionsSnapshot {
             screen_recording: PermissionStatus::Denied,
             camera: PermissionStatus::Granted,
             microphone: PermissionStatus::Granted,
         };
-        let sources = CaptureSources { microphone: false, system_audio: false, webcam: false };
-        assert!(!snap.satisfies(&sources));
+        assert!(!snap.satisfies_requests(&[req(SourceRole::Screen)]));
     }
 
     #[test]
-    fn satisfies_only_demands_mic_when_microphone_source_requested() {
+    fn satisfies_requests_demands_mic_only_when_microphone_role_present() {
         let snap = PermissionsSnapshot {
             screen_recording: PermissionStatus::Granted,
             camera: PermissionStatus::Denied,
             microphone: PermissionStatus::Denied,
         };
-        // Mic off → mic permission doesn't matter.
-        let no_mic = CaptureSources { microphone: false, system_audio: false, webcam: false };
-        assert!(snap.satisfies(&no_mic));
-        // Mic on → mic permission is required.
-        let with_mic = CaptureSources { microphone: true, system_audio: false, webcam: false };
-        assert!(!snap.satisfies(&with_mic));
+        // Screen only — mic permission irrelevant.
+        assert!(snap.satisfies_requests(&[req(SourceRole::Screen)]));
+        // Screen + Mic — mic permission required.
+        assert!(!snap.satisfies_requests(&[
+            req(SourceRole::Screen),
+            req(SourceRole::Microphone)
+        ]));
     }
 
     #[test]
-    fn satisfies_only_demands_camera_when_webcam_source_requested() {
+    fn satisfies_requests_demands_camera_only_when_camera_role_present() {
         let snap = PermissionsSnapshot {
             screen_recording: PermissionStatus::Granted,
             camera: PermissionStatus::Denied,
             microphone: PermissionStatus::Granted,
         };
-        let no_cam = CaptureSources { microphone: true, system_audio: false, webcam: false };
-        assert!(snap.satisfies(&no_cam));
-        let with_cam = CaptureSources { microphone: true, system_audio: false, webcam: true };
-        assert!(!snap.satisfies(&with_cam));
+        assert!(snap.satisfies_requests(&[
+            req(SourceRole::Screen),
+            req(SourceRole::Microphone)
+        ]));
+        assert!(!snap.satisfies_requests(&[
+            req(SourceRole::Screen),
+            req(SourceRole::Camera)
+        ]));
+    }
+
+    #[test]
+    fn window_and_system_audio_ride_on_screen_recording_permission() {
+        let snap = PermissionsSnapshot {
+            screen_recording: PermissionStatus::Granted,
+            camera: PermissionStatus::Denied,
+            microphone: PermissionStatus::Denied,
+        };
+        assert!(snap.satisfies_requests(&[req(SourceRole::Window)]));
+        assert!(snap.satisfies_requests(&[req(SourceRole::SystemAudio)]));
     }
 
     #[test]

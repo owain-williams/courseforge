@@ -4,7 +4,6 @@ pub mod export_manager;
 pub mod exporter;
 pub mod recorder;
 pub mod recording_manager;
-pub mod remuxer;
 pub mod transcriber;
 pub mod transcription_manager;
 mod windows;
@@ -17,7 +16,6 @@ pub fn run() {
         .manage(windows::CourseWindowRegistry::default())
         .manage(recording_manager::RecordingManager::new(
             recorder::default_backend(),
-            remuxer::default_remuxer(),
         ))
         .manage(transcription_manager::TranscriptionManager::new(
             transcriber::default_backend(),

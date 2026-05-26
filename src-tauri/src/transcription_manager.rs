@@ -238,11 +238,22 @@ fn segment_id_from_path(p: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::capture::{CaptureRequest, CompositionDefaults, Device, SourceRole};
     use crate::core::transcript::Word;
     use crate::recorder::fake::FakeRecorderBackend;
     use crate::recording_manager::RecordingManager;
-    use crate::remuxer::fake::FakeRemuxer;
     use crate::transcriber::fake::{FakeTranscriberBackend, ScriptedResponse};
+
+    fn screen_request() -> CaptureRequest {
+        CaptureRequest {
+            role: SourceRole::Screen,
+            device: Device {
+                id: "default".into(),
+                label: "Main Display".into(),
+            },
+            defaults: CompositionDefaults::default(),
+        }
+    }
 
     fn make_manager() -> (TranscriptionManager, Arc<FakeTranscriberBackend>) {
         let backend = Arc::new(FakeTranscriberBackend::default());
@@ -262,12 +273,9 @@ mod tests {
 
         // Drive a real (fake-backed) recording through to a finalised Segment
         // so the transcription queue has a real Segment to find on disk.
-        let rec_mgr = RecordingManager::new(
-            Box::new(FakeRecorderBackend::default()),
-            Box::new(FakeRemuxer::default()),
-        );
+        let rec_mgr = RecordingManager::new(Box::new(FakeRecorderBackend::default()));
         let snap = rec_mgr
-            .start_session(&folder, &v.id, Default::default())
+            .start_session(&folder, &v.id, vec![screen_request()])
             .unwrap();
         rec_mgr.stop_session(&snap.id).unwrap();
         let seg = rec_mgr.keep_session(&snap.id).unwrap();
@@ -333,8 +341,8 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("mp4"))
-            .expect("a finalised .mp4 should exist");
+            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("mov"))
+            .expect("a finalised .mov should exist");
         backend.script(&seg_path, ScriptedResponse::Err("ASR exploded".into()));
 
         mgr.enqueue(folder.clone(), vid.clone());
@@ -357,7 +365,7 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("mp4"))
+            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("mov"))
             .unwrap();
         backend.script(&seg_path, ScriptedResponse::Err("nope".into()));
 

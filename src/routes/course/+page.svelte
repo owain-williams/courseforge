@@ -55,6 +55,7 @@
     type Segment,
     type OrphanSegment,
     type CaptureSources,
+    captureRequestsFromSources,
     type Transcript,
     type TranscriptionJob,
     type EditState,
@@ -497,7 +498,8 @@
     }
     permsBlockingVideoId = null;
     await withBusy(async () => {
-      const snap = await startRecording(folder!, videoId, recordingSources);
+      const requests = captureRequestsFromSources(recordingSources);
+      const snap = await startRecording(folder!, videoId, requests);
       sessionsByVideo = { ...sessionsByVideo, [videoId]: snap };
       sessionStartedAt = { ...sessionStartedAt, [snap.id]: Date.now() };
     });
@@ -1420,8 +1422,9 @@
                           <span class="rec-label">
                             {sess.state === 'paused' ? 'Paused' : 'Recording…'}
                           </span>
-                          {#if sess.sources.microphone}<span class="src-chip">Mic</span>{/if}
-                          <span class="src-chip">Screen</span>
+                          {#each sess.requests as req}
+                            <span class="src-chip">{req.role === 'microphone' ? 'Mic' : req.role === 'screen' ? 'Screen' : req.role}</span>
+                          {/each}
                         </div>
                         <div class="actions">
                           {#if sess.state === 'recording'}

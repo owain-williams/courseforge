@@ -41,8 +41,12 @@
     deleteScene,
     addSceneSource,
     removeSceneSource,
+    setSceneSourceDevice,
+    listCaptureDevices,
+    DEFAULT_DEVICE,
     type Scene,
     type SourceRole,
+    type Device,
     listTranscriptionJobs,
     retryTranscription,
     getTranscript,
@@ -206,6 +210,81 @@
         x.id === s.id ? { ...x, sources: [...x.sources, added] } : x
       );
       addSourcePickerOpenForScene = null;
+    } catch (e) {
+      error = formatError(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  // Per-role device list cache. Each role's list is loaded lazily on first
+  // dropdown render and re-queried on Refresh. Live OS state changes (a
+  // USB camera plugged in / out) only get picked up on Refresh.
+  let deviceListsByRole = $state<Partial<Record<SourceRole, Device[]>>>({});
+  let deviceListLoading = $state<Partial<Record<SourceRole, boolean>>>({});
+
+  async function ensureDeviceList(role: SourceRole, force = false) {
+    if (!force && deviceListsByRole[role] !== undefined) return;
+    deviceListLoading[role] = true;
+    try {
+      const list = await listCaptureDevices(role);
+      deviceListsByRole[role] = list;
+    } catch (e) {
+      // Don't bubble up — the dropdown will just show only the Default
+      // entry, with no real-device options. The error log helps debug.
+      console.warn('listCaptureDevices', role, e);
+      deviceListsByRole[role] = [];
+    } finally {
+      deviceListLoading[role] = false;
+    }
+  }
+
+  async function refreshDeviceList(role: SourceRole) {
+    await ensureDeviceList(role, true);
+  }
+
+  // Dropdown options for a SceneSource: Default sentinel + the live list
+  // + (if the row's currently-bound device isn't in the live list) the
+  // stale entry flagged "(missing)".
+  function dropdownOptions(
+    role: SourceRole,
+    bound: Device
+  ): { device: Device; missing: boolean }[] {
+    const live = deviceListsByRole[role] ?? [];
+    const opts: { device: Device; missing: boolean }[] = [
+      { device: DEFAULT_DEVICE, missing: false }
+    ];
+    for (const d of live) {
+      if (d.id === DEFAULT_DEVICE.id) continue;
+      opts.push({ device: d, missing: false });
+    }
+    const knownIds = new Set(opts.map((o) => o.device.id));
+    if (!knownIds.has(bound.id)) {
+      opts.push({ device: bound, missing: true });
+    }
+    return opts;
+  }
+
+  async function pickDeviceForSource(
+    s: Scene,
+    sourceIndex: number,
+    deviceJson: string
+  ) {
+    if (!folder) return;
+    const device: Device = JSON.parse(deviceJson);
+    busy = true;
+    try {
+      const updated = await setSceneSourceDevice(folder, s.id, sourceIndex, device);
+      scenes = scenes.map((x) =>
+        x.id === s.id
+          ? {
+              ...x,
+              sources: x.sources.map((src, i) =>
+                i === sourceIndex ? updated : src
+              )
+            }
+          : x
+      );
     } catch (e) {
       error = formatError(e);
     } finally {
@@ -1899,11 +1978,36 @@
                 </div>
               </header>
 
-              <ul class="source-chips" aria-label="Source roles for {s.name}">
+              <ul class="source-rows" aria-label="Source roles for {s.name}">
                 {#each s.sources as src, i (i)}
-                  <li class="chip">
+                  {@const opts = dropdownOptions(src.role, src.device)}
+                  {@const loading = deviceListLoading[src.role] === true}
+                  <li
+                    class="source-row"
+                    onpointerenter={() => void ensureDeviceList(src.role)}
+                  >
                     <span class="chip-role">{sourceRoleLabel(src.role)}</span>
-                    <span class="chip-device" title={src.device.id}>{src.device.label}</span>
+                    <select
+                      class="device-select"
+                      class:missing={opts.find((o) => o.device.id === src.device.id)?.missing}
+                      disabled={busy}
+                      value={JSON.stringify(src.device)}
+                      onchange={(e) =>
+                        pickDeviceForSource(s, i, (e.currentTarget as HTMLSelectElement).value)}
+                    >
+                      {#each opts as opt (opt.device.id)}
+                        <option value={JSON.stringify(opt.device)}>
+                          {opt.device.label}{opt.missing ? ' (missing)' : ''}
+                        </option>
+                      {/each}
+                    </select>
+                    <button
+                      class="ghost refresh"
+                      aria-label="Refresh device list"
+                      disabled={busy || loading}
+                      onclick={() => refreshDeviceList(src.role)}
+                      title="Refresh device list"
+                    >{loading ? '…' : '↻'}</button>
                     <button
                       class="chip-remove"
                       aria-label="Remove source"
@@ -1912,6 +2016,9 @@
                     >×</button>
                   </li>
                 {/each}
+                {#if s.sources.length === 0}
+                  <li class="source-empty">No sources yet — click "Add Source" below.</li>
+                {/if}
               </ul>
 
               {#if addSourcePickerOpenForScene === s.id}
@@ -2644,6 +2751,47 @@
     display: flex;
     flex-wrap: wrap;
     gap: 0.4rem;
+  }
+  .source-rows {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+  .source-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    padding: 0.25rem 0.6rem;
+  }
+  .source-row .chip-role {
+    min-width: 7rem;
+  }
+  .source-row .device-select {
+    flex: 1;
+    max-width: 22rem;
+    padding: 0.2rem 0.4rem;
+  }
+  .source-row .device-select.missing {
+    border-color: #c00;
+    color: #c00;
+  }
+  .source-row .refresh {
+    padding: 0.1rem 0.4rem;
+    font-size: 1rem;
+  }
+  .source-empty {
+    color: #888;
+    font-style: italic;
+    background: none;
+    border: 1px dashed #ddd;
+    padding: 0.4rem 0.6rem;
+    border-radius: 4px;
   }
   .chip {
     display: inline-flex;

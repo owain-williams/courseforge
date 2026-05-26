@@ -232,6 +232,30 @@ pub fn remove_scene_source(folder: &Path, scene_id: &str, source_index: usize) -
     })
 }
 
+/// Set the bound device on one source row. The device-picker (issue #34)
+/// calls this each time the user changes the dropdown selection; the
+/// "Default" entry keeps `Device.id == "default"` so Scenes stay portable
+/// across machines where specific device ids may differ.
+pub fn set_scene_source_device(
+    folder: &Path,
+    scene_id: &str,
+    source_index: usize,
+    device: Device,
+) -> Result<SceneSource> {
+    mutate_scenes(folder, |f| {
+        let s = find_scene_mut(f, scene_id)?;
+        if source_index >= s.sources.len() {
+            return Err(CoreError::SceneSourceIndexOutOfBounds {
+                scene_id: scene_id.to_string(),
+                index: source_index,
+                len: s.sources.len(),
+            });
+        }
+        s.sources[source_index].device = device;
+        Ok(s.sources[source_index].clone())
+    })
+}
+
 fn find_scene_mut<'a>(file: &'a mut ScenesFile, scene_id: &str) -> Result<&'a mut Scene> {
     file.scenes
         .iter_mut()
@@ -464,5 +488,55 @@ mod tests {
         std::fs::write(dir.path().join(SCENES_JSON), b"not json").unwrap();
         let err = read_scenes(dir.path()).unwrap_err();
         assert!(matches!(err, CoreError::InvalidScenesJson { .. }));
+    }
+
+    #[test]
+    fn set_scene_source_device_updates_the_device_and_persists() {
+        let dir = tmp();
+        let s = create_scene(dir.path(), "A").unwrap();
+        add_scene_source(dir.path(), &s.id, SourceRole::Camera).unwrap();
+        let real_device = Device {
+            id: "0xFACECAM01".into(),
+            label: "FaceTime HD".into(),
+        };
+        let updated =
+            set_scene_source_device(dir.path(), &s.id, 0, real_device.clone()).unwrap();
+        assert_eq!(updated.device, real_device);
+        let list = list_scenes(dir.path()).unwrap();
+        assert_eq!(list[0].sources[0].device, real_device);
+    }
+
+    #[test]
+    fn set_scene_source_device_out_of_bounds_is_an_error() {
+        let dir = tmp();
+        let s = create_scene(dir.path(), "A").unwrap();
+        let err = set_scene_source_device(
+            dir.path(),
+            &s.id,
+            0,
+            Device { id: "x".into(), label: "X".into() },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::SceneSourceIndexOutOfBounds { .. }
+        ));
+    }
+
+    #[test]
+    fn set_scene_source_device_accepts_default_sentinel_for_portability() {
+        // Picking "Default" in the dropdown keeps Device.id == "default" so
+        // a Scene copied to another Mac with different device ids still
+        // resolves to *that* machine's default at Record time.
+        let dir = tmp();
+        let s = create_scene(dir.path(), "A").unwrap();
+        add_scene_source(dir.path(), &s.id, SourceRole::Microphone).unwrap();
+        let default_device = Device {
+            id: "default".into(),
+            label: "Default Microphone".into(),
+        };
+        set_scene_source_device(dir.path(), &s.id, 0, default_device.clone()).unwrap();
+        let list = list_scenes(dir.path()).unwrap();
+        assert_eq!(list[0].sources[0].device.id, "default");
     }
 }

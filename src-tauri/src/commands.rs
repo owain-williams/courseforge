@@ -8,7 +8,8 @@ use crate::core::permissions::{
     self, PermissionsSnapshot, SettingsPane,
 };
 use crate::core::scenes::{self, Scene, SceneSource};
-use crate::core::capture::SourceRole;
+use crate::core::capture::{Device, SourceRole};
+use crate::core::devices;
 use crate::core::segments::{self, OrphanSegment, Segment};
 use crate::core::transcript::{self, Transcript};
 use crate::export_manager::{ExportJob, ExportManager};
@@ -468,6 +469,26 @@ pub fn remove_scene_source(
     source_index: usize,
 ) -> Result<(), AppError> {
     Ok(scenes::remove_scene_source(&folder, &scene_id, source_index)?)
+}
+
+#[tauri::command]
+pub fn set_scene_source_device(
+    folder: PathBuf,
+    scene_id: String,
+    source_index: usize,
+    device: Device,
+) -> Result<SceneSource, AppError> {
+    Ok(scenes::set_scene_source_device(
+        &folder,
+        &scene_id,
+        source_index,
+        device,
+    )?)
+}
+
+#[tauri::command]
+pub fn list_capture_devices(role: SourceRole) -> Result<Vec<Device>, AppError> {
+    Ok(devices::list_capture_devices(role)?)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 pub mod capture;
 pub mod config;
 pub mod course;
+pub mod devices;
 pub mod edits;
 pub mod error;
 pub mod export;

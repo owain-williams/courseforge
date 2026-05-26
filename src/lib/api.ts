@@ -340,6 +340,30 @@ export const addSceneSource = (folder: string, sceneId: string, role: SourceRole
 export const removeSceneSource = (folder: string, sceneId: string, sourceIndex: number) =>
   invoke<void>('remove_scene_source', { folder, sceneId, sourceIndex });
 
+export const setSceneSourceDevice = (
+  folder: string,
+  sceneId: string,
+  sourceIndex: number,
+  device: Device
+) =>
+  invoke<SceneSource>('set_scene_source_device', {
+    folder,
+    sceneId,
+    sourceIndex,
+    device
+  });
+
+/// Live device enumeration per role (issue #34). Queries SCK /
+/// AVCaptureDevice at call time so USB / Continuity Camera changes show up
+/// on Refresh. An empty list is not an error — the host just has no
+/// hardware of that role attached.
+export const listCaptureDevices = (role: SourceRole) =>
+  invoke<Device[]>('list_capture_devices', { role });
+
+/// The "use the system default" entry every dropdown carries — keeps
+/// Device.id == "default" so Scenes stay portable across machines.
+export const DEFAULT_DEVICE: Device = { id: 'default', label: 'Default' };
+
 // ---------------------------------------------------------------------------
 // Transcription
 // ---------------------------------------------------------------------------

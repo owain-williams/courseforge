@@ -104,6 +104,8 @@ pub fn run() {
             commands::delete_scene,
             commands::add_scene_source,
             commands::remove_scene_source,
+            commands::set_scene_source_device,
+            commands::list_capture_devices,
             commands::list_transcription_jobs,
             commands::retry_transcription,
             commands::get_transcript,

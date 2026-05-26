@@ -78,6 +78,27 @@ pub enum CoreError {
 
     #[error("transcription job not found: {0}")]
     TranscriptionJobNotFound(String),
+
+    #[error("exporter backend failed: {0}")]
+    Exporter(String),
+
+    #[error("export cancelled by user")]
+    ExportCancelled,
+
+    #[error("export job not found: {0}")]
+    ExportJobNotFound(String),
+
+    #[error("export needs at least one Segment for video: {0}")]
+    NoSegmentsForExport(String),
+
+    #[error("a transcript is required to export captions for video: {0}")]
+    NoTranscriptForExport(String),
+
+    #[error("cannot determine duration of {path}: {message}")]
+    DurationUnknown { path: PathBuf, message: String },
+
+    #[error("an export is already in progress for video: {0}")]
+    ExportAlreadyRunning(String),
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;

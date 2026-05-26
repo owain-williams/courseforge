@@ -1,5 +1,7 @@
 pub mod core;
 mod commands;
+pub mod export_manager;
+pub mod exporter;
 pub mod recorder;
 pub mod recording_manager;
 pub mod remuxer;
@@ -8,6 +10,8 @@ pub mod transcription_manager;
 mod windows;
 
 pub fn run() {
+    let export_manager =
+        std::sync::Arc::new(export_manager::ExportManager::new(exporter::default_exporter()));
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(windows::CourseWindowRegistry::default())
@@ -18,6 +22,7 @@ pub fn run() {
         .manage(transcription_manager::TranscriptionManager::new(
             transcriber::default_backend(),
         ))
+        .manage(export_manager)
         .setup(|app| {
             use tauri::{Emitter, Manager};
             // Bridge the manager's subscriber to a Tauri event so the
@@ -28,6 +33,16 @@ pub fn run() {
                 let mgr = app.state::<transcription_manager::TranscriptionManager>();
                 mgr.set_subscriber(Box::new(move |job| {
                     let _ = handle.emit("transcription-job", job);
+                }));
+            }
+
+            // Same wiring for the export manager — push status changes to
+            // an `export-job` event the UI can subscribe to.
+            let handle = app.handle().clone();
+            {
+                let mgr = app.state::<std::sync::Arc<export_manager::ExportManager>>();
+                mgr.set_subscriber(Box::new(move |job| {
+                    let _ = handle.emit("export-job", job);
                 }));
             }
 
@@ -91,6 +106,10 @@ pub fn run() {
             commands::add_cut,
             commands::undo_edit,
             commands::redo_edit,
+            commands::default_export_dir,
+            commands::start_export,
+            commands::cancel_export,
+            commands::list_export_jobs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

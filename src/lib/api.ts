@@ -308,3 +308,50 @@ export const undoEdit = (folder: string, videoId: string) =>
 
 export const redoEdit = (folder: string, videoId: string) =>
   invoke<EditState>('redo_edit', { folder, videoId });
+
+// ---------------------------------------------------------------------------
+// Export
+// ---------------------------------------------------------------------------
+
+export type ExportStatus =
+  | { kind: 'pending' }
+  | { kind: 'running'; fraction: number }
+  | { kind: 'done'; mp4: string; srt: string }
+  | { kind: 'failed'; message: string }
+  | { kind: 'cancelled' };
+
+export type ExportJob = {
+  videoId: string;
+  courseFolder: string;
+  destinationDir: string;
+  status: ExportStatus;
+};
+
+export const defaultExportDir = (folder: string, videoId: string) =>
+  invoke<string>('default_export_dir', { folder, videoId });
+
+export const startExport = (
+  folder: string,
+  videoId: string,
+  destinationDir?: string | null
+) =>
+  invoke<ExportJob>('start_export', {
+    folder,
+    videoId,
+    destinationDir: destinationDir ?? null
+  });
+
+export const cancelExport = (videoId: string) =>
+  invoke<void>('cancel_export', { videoId });
+
+export const listExportJobs = () => invoke<ExportJob[]>('list_export_jobs');
+
+export const pickExportDirectory = async (defaultPath?: string | null) => {
+  const result = await open({
+    directory: true,
+    multiple: false,
+    defaultPath: defaultPath ?? undefined,
+    title: 'Choose where to save the exported MP4'
+  });
+  return typeof result === 'string' ? result : null;
+};

@@ -8,9 +8,11 @@ use crate::core::permissions::{
 };
 use crate::core::segments::{self, OrphanSegment, Segment};
 use crate::core::transcript::{self, Transcript};
+use crate::export_manager::{ExportJob, ExportManager};
 use crate::recording_manager::{RecordingManager, SessionSnapshot};
 use crate::transcription_manager::{TranscriptionJob, TranscriptionManager};
 use crate::windows::{CourseWindowRegistry, OpenDecision};
+use std::sync::Arc;
 
 #[derive(Debug, Serialize)]
 pub struct AppError {
@@ -466,4 +468,39 @@ pub fn undo_edit(folder: PathBuf, video_id: String) -> Result<EditState, AppErro
 #[tauri::command]
 pub fn redo_edit(folder: PathBuf, video_id: String) -> Result<EditState, AppError> {
     Ok(edits::append_redo(&folder, &video_id)?)
+}
+
+// ---------------------------------------------------------------------------
+// Export
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn default_export_dir(folder: PathBuf, video_id: String) -> PathBuf {
+    crate::core::export::default_export_dir(&folder, &video_id)
+}
+
+/// Kick off an export job for one Video. The renderer runs on a background
+/// thread; the returned snapshot is the initial Pending state, and the
+/// frontend listens to the `export-job` event for updates.
+#[tauri::command]
+pub fn start_export(
+    exports: tauri::State<'_, Arc<ExportManager>>,
+    folder: PathBuf,
+    video_id: String,
+    destination_dir: Option<PathBuf>,
+) -> Result<ExportJob, AppError> {
+    Ok(exports.spawn_export(folder, video_id, destination_dir)?)
+}
+
+#[tauri::command]
+pub fn cancel_export(
+    exports: tauri::State<'_, Arc<ExportManager>>,
+    video_id: String,
+) -> Result<(), AppError> {
+    Ok(exports.cancel(&video_id)?)
+}
+
+#[tauri::command]
+pub fn list_export_jobs(exports: tauri::State<'_, Arc<ExportManager>>) -> Vec<ExportJob> {
+    exports.jobs()
 }

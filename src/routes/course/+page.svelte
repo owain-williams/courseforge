@@ -41,6 +41,11 @@
     addCut,
     undoEdit,
     redoEdit,
+    startExport,
+    cancelExport,
+    listExportJobs,
+    defaultExportDir,
+    pickExportDirectory,
     type Course,
     type Module,
     type Video,
@@ -54,6 +59,7 @@
     type TranscriptionJob,
     type EditState,
     type Cut,
+    type ExportJob,
     formatError
   } from '$lib/api';
 
@@ -620,6 +626,11 @@
   let selectionAnchorByVideo = $state<Record<string, number | null>>({});
   let selectionHeadByVideo = $state<Record<string, number | null>>({});
 
+  // Export jobs (issue #10): per-Video render-to-MP4 + .srt status. Mirrors
+  // the transcription job pattern — the manager streams updates via the
+  // `export-job` event so the UI stays in sync without polling.
+  let exportJobByVideo = $state<Record<string, ExportJob>>({});
+
   async function refreshJobs() {
     try {
       const list = await listTranscriptionJobs();
@@ -739,6 +750,82 @@
     } catch (e) {
       error = formatError(e);
     }
+  }
+
+  // ----- Preview & Export -----
+
+  /// Reset the playhead to 0 and play through with EDL skips applied.
+  /// "Preview" in the AC sense — "applies the EDL in-app — full
+  /// playthrough of the Video as it would render". EDL skip logic already
+  /// runs from `onTimeUpdate`; this just gets playback started from the
+  /// beginning so the user sees the whole edited Video without scrubbing.
+  function previewFrom(videoId: string) {
+    if (openVideoId !== videoId) return;
+    if (!videoEl) return;
+    // If we're already at the start a cut covers, the first ontimeupdate
+    // will hop the playhead forward — no extra logic needed here.
+    videoEl.currentTime = 0;
+    void videoEl.play();
+  }
+
+  async function refreshExportJobs() {
+    try {
+      const list = await listExportJobs();
+      const next: Record<string, ExportJob> = {};
+      for (const j of list) next[j.videoId] = j;
+      exportJobByVideo = next;
+    } catch (e) {
+      console.warn('listExportJobs failed', e);
+    }
+  }
+
+  function applyExportJob(job: ExportJob) {
+    exportJobByVideo = { ...exportJobByVideo, [job.videoId]: job };
+  }
+
+  async function exportFor(videoId: string) {
+    if (!folder) return;
+    try {
+      const suggested = await defaultExportDir(folder, videoId);
+      // Pick the *parent* of the default dir so the user lands somewhere
+      // familiar (the Course Folder) rather than inside an `exports/<vid>`
+      // subdir that won't exist yet. Cancelling the dialog leaves
+      // `chosen` null → fall back to the default destination.
+      const parent = suggested.replace(/\/[^/]+$/, '');
+      const chosen = await pickExportDirectory(parent);
+      const job = await startExport(folder, videoId, chosen);
+      applyExportJob(job);
+    } catch (e) {
+      error = formatError(e);
+    }
+  }
+
+  async function cancelExportFor(videoId: string) {
+    try {
+      await cancelExport(videoId);
+    } catch (e) {
+      error = formatError(e);
+    }
+  }
+
+  function exportLabel(job: ExportJob | undefined): string | null {
+    if (!job) return null;
+    switch (job.status.kind) {
+      case 'pending':
+        return 'Export queued…';
+      case 'running':
+        return `Exporting ${Math.round(job.status.fraction * 100)}%`;
+      case 'done':
+        return 'Export complete';
+      case 'failed':
+        return 'Export failed';
+      case 'cancelled':
+        return 'Export cancelled';
+    }
+  }
+
+  function exportIsActive(job: ExportJob | undefined): boolean {
+    return !!job && (job.status.kind === 'pending' || job.status.kind === 'running');
   }
 
   function onWordClick(e: MouseEvent, videoId: string, idx: number, w: { start: number }) {
@@ -895,6 +982,7 @@
   onMount(() => {
     let unlistenClose: (() => void) | null = null;
     let unlistenJob: UnlistenFn | null = null;
+    let unlistenExport: UnlistenFn | null = null;
     void (async () => {
       try {
         folder = await getWindowCourseFolder();
@@ -908,7 +996,8 @@
           refreshSessions(),
           refreshOrphans(),
           refreshAllSegments(),
-          refreshJobs()
+          refreshJobs(),
+          refreshExportJobs()
         ]);
 
         // Push updates from the transcription worker keep the per-Video
@@ -919,6 +1008,15 @@
           });
         } catch (e) {
           console.warn('transcription-job listener wiring failed', e);
+        }
+
+        // Same wiring for export status updates.
+        try {
+          unlistenExport = await listen<ExportJob>('export-job', (e) => {
+            applyExportJob(e.payload);
+          });
+        } catch (e) {
+          console.warn('export-job listener wiring failed', e);
         }
 
         // Close-window guard: while any session is non-terminal, intercept
@@ -956,6 +1054,7 @@
     return () => {
       if (unlistenClose) unlistenClose();
       if (unlistenJob) unlistenJob();
+      if (unlistenExport) unlistenExport();
     };
   });
 </script>
@@ -1406,6 +1505,8 @@
                             <button class="link" onclick={() => retryFor(v.id)}>Retry</button>
                           </div>
                         {:else if t && t.words.length > 0}
+                          {@const expJob = exportJobByVideo[v.id]}
+                          {@const expActive = exportIsActive(expJob)}
                           <div class="edit-toolbar">
                             <button
                               class="primary cut-btn"
@@ -1428,7 +1529,52 @@
                             <span class="cut-hint">
                               {edl?.cuts.length ?? 0} cut{(edl?.cuts.length ?? 0) === 1 ? '' : 's'}
                             </span>
+                            <span class="toolbar-spacer"></span>
+                            <button
+                              class="ghost"
+                              onclick={() => previewFrom(v.id)}
+                              title="Play from the start with all cuts applied"
+                            >Preview</button>
+                            {#if expActive}
+                              <button
+                                class="ghost danger"
+                                onclick={() => cancelExportFor(v.id)}
+                                title="Cancel the in-progress export"
+                              >Cancel</button>
+                            {:else}
+                              <button
+                                class="primary"
+                                onclick={() => exportFor(v.id)}
+                                title="Render this Video to MP4 + .srt"
+                              >Export Video…</button>
+                            {/if}
                           </div>
+                          {#if expJob}
+                            <div
+                              class="export-status"
+                              class:running={expJob.status.kind === 'running' || expJob.status.kind === 'pending'}
+                              class:failed={expJob.status.kind === 'failed'}
+                              class:done={expJob.status.kind === 'done'}
+                              class:cancelled={expJob.status.kind === 'cancelled'}
+                            >
+                              <span>{exportLabel(expJob)}</span>
+                              {#if expJob.status.kind === 'running'}
+                                <div
+                                  class="progress"
+                                  role="progressbar"
+                                  aria-valuenow={Math.round(expJob.status.fraction * 100)}
+                                  aria-valuemin="0"
+                                  aria-valuemax="100"
+                                >
+                                  <div class="progress-fill" style="width: {Math.round(expJob.status.fraction * 100)}%"></div>
+                                </div>
+                              {:else if expJob.status.kind === 'done'}
+                                <code class="export-path" title={expJob.status.mp4}>{expJob.status.mp4}</code>
+                              {:else if expJob.status.kind === 'failed'}
+                                <span class="export-error" title={expJob.status.message}>{expJob.status.message}</span>
+                              {/if}
+                            </div>
+                          {/if}
                           <p class="transcript-words" aria-label="Transcript">
                             {#each t.words as w, i (i)}
                               <button
@@ -2103,9 +2249,60 @@
     font-size: 0.8rem;
   }
   .cut-hint {
-    margin-left: auto;
     font-size: 0.75rem;
     color: #888;
+  }
+  .toolbar-spacer { flex: 1; }
+  .edit-toolbar .ghost.danger {
+    color: #a31515;
+    border-color: #f3b8b8;
+  }
+  .export-status {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.5rem 0;
+    padding: 0.45rem 0.65rem;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    background: #f4f6fb;
+    border: 1px solid #d8def0;
+    color: #324b8a;
+  }
+  .export-status.failed {
+    background: #fff0f0;
+    border-color: #f3b8b8;
+    color: #8a1a1a;
+  }
+  .export-status.done {
+    background: #eefbe9;
+    border-color: #c4e6b4;
+    color: #29701a;
+  }
+  .export-status.cancelled {
+    background: #f4f4f4;
+    border-color: #d8d8d8;
+    color: #666;
+  }
+  .export-status .progress { flex: 1; }
+  .export-path {
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 0.72rem;
+    color: #4a4a4a;
+    background: rgba(0, 0, 0, 0.04);
+    padding: 1px 5px;
+    border-radius: 3px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 28rem;
+  }
+  .export-error {
+    color: #8a1a1a;
+    max-width: 28rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   /* Focusable video panel — give it a subtle hint when focused so

@@ -26,6 +26,8 @@ hound = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = { version = "0.16", features = ["metal"] }
+objc2-av-foundation = { version = "0.3.2", features = ["AVCaptureDevice", "AVMediaFormat"] }
+objc2-foundation = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

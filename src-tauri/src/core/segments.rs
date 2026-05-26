@@ -2,26 +2,42 @@
 //!
 //! On disk, per ADR-0001 and CONTEXT.md, downstream per-Video state lives in
 //! per-Video subfolders rather than inside `course.json`. Segments follow that
-//! rule: they sit at `videos/<video-id>/segments/<segment-id>.mp4`, and the
+//! rule: they sit at `videos/<video-id>/segments/<segment-id>.mov`, and the
 //! Library / Course view discovers them by scanning the folder — there is no
 //! segments[] array in `course.json` that could drift out of sync.
 //!
-//! During capture a segment is written as `<id>.partial.mkv`. Matroska is
-//! robust to abrupt termination (the WebKit `<video>` element can't play it
-//! though). On a clean Stop the user is asked Keep / Discard; Keep
-//! losslessly **remuxes** the `.partial.mkv` into `<id>.mp4` via a caller-
-//! supplied closure — the streams are stream-copied, not re-encoded — and
-//! removes the `.partial.mkv`. Discard removes the `.partial.mkv` directly.
-//! If the app or OS crashes mid-capture the `.partial.mkv` is left behind;
-//! on next launch we offer those orphans back to the user as importable
-//! Segments (which also goes through the remux step).
+//! Per ADR-0002 (Phase 1), capture writes a `.partial.mov` directly via
+//! AVAssetWriter; on Keep we rename the partial to its final name and emit a
+//! per-Segment sidecar JSON (`<segment-id>.json`) carrying take grouping,
+//! source role, device, defaults, and the reason the recording ended.
+//! Discard removes the partial directly.
+//!
+//! v1 Course Folders predate this change. We continue to discover legacy
+//! `.mp4` finals and legacy `.partial.mkv` orphans on read so existing
+//! Courses still open. Importing a v1 `.partial.mkv` orphan goes through a
+//! small inline ffmpeg remux (the v1 behaviour kept on the orphan path
+//! only); Phase 7 polishes this.
 
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
+use crate::core::capture::SegmentSidecar;
 use crate::core::error::{CoreError, Result};
 
-pub const SEGMENT_EXT: &str = "mp4";
-pub const PARTIAL_SUFFIX: &str = "partial.mkv";
+/// New (Phase 1) extension for finalised Segments.
+pub const SEGMENT_EXT: &str = "mov";
+/// New (Phase 1) partial suffix for in-progress captures.
+pub const PARTIAL_SUFFIX: &str = "partial.mov";
+/// Sidecar JSON extension, sibling to the Segment file.
+pub const SIDECAR_EXT: &str = "json";
+
+/// v1 finalised-Segment extension. Kept readable forever — v1 Course Folders
+/// open under v2 builds without rewriting on disk.
+pub const LEGACY_SEGMENT_EXT: &str = "mp4";
+/// v1 partial-Segment suffix. Kept discoverable so orphans from before
+/// Phase 1 still surface in `scan_orphans` and can be adopted (the adopt
+/// path runs ffmpeg under the hood for these — the only place ffmpeg
+/// touches the recorder side post-Phase-1).
+pub const LEGACY_PARTIAL_SUFFIX: &str = "partial.mkv";
 
 /// A finalised Segment on disk. Discovered by scanning, not stored in course.json.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -29,14 +45,14 @@ pub struct Segment {
     pub id: String,
     #[serde(rename = "videoId")]
     pub video_id: String,
-    /// Path relative to the Course Folder (e.g. `videos/<vid>/segments/<sid>.mkv`).
+    /// Path relative to the Course Folder (e.g. `videos/<vid>/segments/<sid>.mov`).
     /// Relative so a Course Folder copied to another Mac still resolves.
     pub path: PathBuf,
 }
 
-/// An in-progress segment file that survived a crash. Same shape as `Segment`
-/// but the path points at the `.partial.mkv` so the UI / caller knows to offer
-/// import-or-discard rather than treating it as a finished take.
+/// An in-progress segment file that survived a crash. `path` points at the
+/// surviving `.partial.mov` (or legacy `.partial.mkv`) so the UI / caller
+/// knows to offer import-or-discard rather than treating it as a finished take.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OrphanSegment {
     pub id: String,
@@ -53,8 +69,12 @@ fn segments_dir(folder: &Path, video_id: &str) -> PathBuf {
     folder.join("videos").join(video_id).join("segments")
 }
 
+fn sidecar_path_for(folder: &Path, video_id: &str, segment_id: &str) -> PathBuf {
+    segments_dir(folder, video_id).join(format!("{segment_id}.{SIDECAR_EXT}"))
+}
+
 /// Allocate a fresh Segment id and the absolute path the recorder should
-/// stream the `.partial.mkv` to. The segments folder is created if missing.
+/// stream the `.partial.mov` to. The segments folder is created if missing.
 /// Returns the absolute path so the recorder doesn't have to know about the
 /// Course Folder layout — callers serialise it back to a relative path
 /// before persisting (see `to_relative`).
@@ -69,34 +89,40 @@ pub fn prepare_segment_path(folder: &Path, video_id: &str) -> Result<(String, Pa
     Ok((id, path))
 }
 
-/// Remux `<id>.partial.mkv` → `<id>.mp4` and drop the partial, promoting an
-/// in-progress capture to a real Segment. The remux is delegated to the
-/// caller-supplied `remux_fn` so this module stays platform-agnostic and
-/// tests can substitute a byte-for-byte copy. Idempotent-ish: if
-/// `.partial.mkv` is missing but the final `.mp4` already exists we treat
-/// that as already-finalised and return it; otherwise we error.
+/// Promote an in-progress `.partial.mov` to its final name and write the
+/// per-Segment sidecar JSON next to it. Idempotent: if the partial is gone
+/// but the final `.mov` is already in place, that's "already finalised" and
+/// we just (re)write the sidecar so callers can update its metadata after
+/// the fact.
+///
+/// No remux. AVAssetWriter writes `.mov` directly; WebKit `<video>` plays
+/// `.mov` natively (the v1 `.partial.mkv → .mp4` remux retires here).
 pub fn finalize_segment(
     folder: &Path,
     video_id: &str,
     segment_id: &str,
-    remux_fn: impl FnOnce(&Path, &Path) -> Result<()>,
+    sidecar: SegmentSidecar,
 ) -> Result<Segment> {
     let dir = segments_dir(folder, video_id);
     let partial = dir.join(format!("{segment_id}.{PARTIAL_SUFFIX}"));
     let final_path = dir.join(format!("{segment_id}.{SEGMENT_EXT}"));
 
     if partial.is_file() {
-        remux_fn(&partial, &final_path)?;
-        // Drop the partial once the MP4 is durably written. If removal fails
-        // it's not fatal — the next finalize call will short-circuit on the
-        // existing MP4 — but we propagate so callers can log.
-        std::fs::remove_file(&partial).map_err(|e| CoreError::Io {
-            path: partial.clone(),
+        // Rename is atomic on the same filesystem (segments live under one
+        // course folder, so this holds). If a stale final exists from a
+        // half-completed previous finalize, replace it.
+        if final_path.exists() {
+            let _ = std::fs::remove_file(&final_path);
+        }
+        std::fs::rename(&partial, &final_path).map_err(|e| CoreError::Io {
+            path: final_path.clone(),
             source: e,
         })?;
     } else if !final_path.is_file() {
         return Err(CoreError::SegmentNotFound(segment_id.to_string()));
     }
+
+    write_sidecar(folder, video_id, segment_id, &sidecar)?;
 
     let rel = to_relative(folder, &final_path);
     Ok(Segment {
@@ -106,24 +132,146 @@ pub fn finalize_segment(
     })
 }
 
-/// Delete the in-progress `.partial.mkv` for a segment. Missing files are
-/// treated as success — Discard is meant to be safe to call after a crash
-/// or after the user already cleaned up by hand.
+/// Adopt a crash-recovered partial as a finished Segment. Two shapes:
+///
+/// * `.partial.mov` (Phase 1+ orphan): rename to `.mov`, write the sidecar
+///   the caller supplies (with `endedReason: crashed`).
+/// * `.partial.mkv` (v1 legacy orphan): remux to `.mp4` via `legacy_remux_fn`
+///   so the result plays in WebKit. No sidecar is written for v1 orphans —
+///   v1 never had them. Phase 7 will harmonise this.
+///
+/// The split is invisible to callers: pass the take-grouping / device info
+/// for new-shape orphans and a closure that knows how to remux for legacy.
+pub fn adopt_orphan(
+    folder: &Path,
+    video_id: &str,
+    segment_id: &str,
+    new_shape_sidecar: SegmentSidecar,
+    legacy_remux_fn: impl FnOnce(&Path, &Path) -> Result<()>,
+) -> Result<Segment> {
+    let dir = segments_dir(folder, video_id);
+    let new_partial = dir.join(format!("{segment_id}.{PARTIAL_SUFFIX}"));
+    let legacy_partial = dir.join(format!("{segment_id}.{LEGACY_PARTIAL_SUFFIX}"));
+
+    if new_partial.is_file() {
+        // Phase 1+ path — same as a normal finalize but with crashed reason
+        // already baked into the caller-supplied sidecar.
+        return finalize_segment(folder, video_id, segment_id, new_shape_sidecar);
+    }
+
+    if legacy_partial.is_file() {
+        let legacy_final = dir.join(format!("{segment_id}.{LEGACY_SEGMENT_EXT}"));
+        legacy_remux_fn(&legacy_partial, &legacy_final)?;
+        // Drop the partial; if removal fails it's not fatal — the next
+        // scan_orphans call will short-circuit on the existing .mp4.
+        let _ = std::fs::remove_file(&legacy_partial);
+        return Ok(Segment {
+            id: segment_id.to_string(),
+            video_id: video_id.to_string(),
+            path: to_relative(folder, &legacy_final),
+        });
+    }
+
+    // Already-finalised by a previous adopt attempt? Either extension counts.
+    let new_final = dir.join(format!("{segment_id}.{SEGMENT_EXT}"));
+    let legacy_final = dir.join(format!("{segment_id}.{LEGACY_SEGMENT_EXT}"));
+    if new_final.is_file() {
+        return Ok(Segment {
+            id: segment_id.to_string(),
+            video_id: video_id.to_string(),
+            path: to_relative(folder, &new_final),
+        });
+    }
+    if legacy_final.is_file() {
+        return Ok(Segment {
+            id: segment_id.to_string(),
+            video_id: video_id.to_string(),
+            path: to_relative(folder, &legacy_final),
+        });
+    }
+
+    Err(CoreError::SegmentNotFound(segment_id.to_string()))
+}
+
+/// Delete the in-progress partial for a Segment. Handles both the new
+/// `.partial.mov` and the legacy `.partial.mkv`. Missing files are treated
+/// as success — Discard is meant to be safe to call after a crash or after
+/// the user already cleaned up by hand.
 pub fn discard_partial(folder: &Path, video_id: &str, segment_id: &str) -> Result<()> {
-    let partial = segments_dir(folder, video_id).join(format!("{segment_id}.{PARTIAL_SUFFIX}"));
-    if partial.is_file() {
-        std::fs::remove_file(&partial).map_err(|e| CoreError::Io {
-            path: partial,
-            source: e,
-        })?;
+    let dir = segments_dir(folder, video_id);
+    for suffix in [PARTIAL_SUFFIX, LEGACY_PARTIAL_SUFFIX] {
+        let partial = dir.join(format!("{segment_id}.{suffix}"));
+        if partial.is_file() {
+            std::fs::remove_file(&partial).map_err(|e| CoreError::Io {
+                path: partial,
+                source: e,
+            })?;
+        }
     }
     Ok(())
 }
 
+/// Write (or overwrite) the sidecar JSON for a Segment. Atomic in the
+/// usual write-temp-then-rename sense so a crashed write can't leave a
+/// half-finished JSON on disk.
+pub fn write_sidecar(
+    folder: &Path,
+    video_id: &str,
+    segment_id: &str,
+    sidecar: &SegmentSidecar,
+) -> Result<()> {
+    let path = sidecar_path_for(folder, video_id, segment_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| CoreError::Io {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(sidecar)
+        .expect("SegmentSidecar serialises cleanly — all fields are JSON-safe");
+    std::fs::write(&tmp, bytes).map_err(|e| CoreError::Io {
+        path: tmp.clone(),
+        source: e,
+    })?;
+    std::fs::rename(&tmp, &path).map_err(|e| CoreError::Io {
+        path: path.clone(),
+        source: e,
+    })?;
+    Ok(())
+}
+
+/// Read the sidecar JSON for a Segment, if present. Returns `None` for
+/// Segments without a sidecar (e.g. legacy v1 `.mp4` Segments that predate
+/// this change) so callers can fall back to whatever defaults they want.
+pub fn read_sidecar(
+    folder: &Path,
+    video_id: &str,
+    segment_id: &str,
+) -> Result<Option<SegmentSidecar>> {
+    let path = sidecar_path_for(folder, video_id, segment_id);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(CoreError::Io { path, source: e }),
+    };
+    let sidecar: SegmentSidecar = serde_json::from_slice(&bytes)
+        .map_err(|source| CoreError::InvalidTranscriptJson {
+            // Reusing the transcript variant intentionally — sidecars predate
+            // their own error variant and the surface is the same shape
+            // (path + serde_json::Error). Worth its own variant if a future
+            // pass adds more sidecar-specific diagnostics.
+            path: path.clone(),
+            source,
+        })?;
+    Ok(Some(sidecar))
+}
+
 /// List finalised Segments for a Video by scanning its segments folder.
-/// Hidden files, the `.partial.mkv` workfiles and anything that isn't a plain
-/// `<id>.mp4` are skipped. Order is by filename so the result is stable for
-/// tests and for UI rendering.
+/// Hidden files, partials, and the sidecar JSONs are skipped. Both the new
+/// `.mov` and the legacy `.mp4` extension are picked up so v1 Course
+/// Folders still play. Order is by id (filename stem) so the result is
+/// stable for tests and for UI rendering.
 pub fn list_segments(folder: &Path, video_id: &str) -> Result<Vec<Segment>> {
     let dir = segments_dir(folder, video_id);
     if !dir.is_dir() {
@@ -143,10 +291,18 @@ pub fn list_segments(folder: &Path, video_id: &str) -> Result<Vec<Segment>> {
             Some(n) => n,
             None => continue,
         };
-        if name.starts_with('.') || name.ends_with(&format!(".{PARTIAL_SUFFIX}")) {
+        if name.starts_with('.') {
             continue;
         }
-        let id = match name.strip_suffix(&format!(".{SEGMENT_EXT}")) {
+        // Skip the two partial-suffix shapes and the sidecar JSON files.
+        if name.ends_with(&format!(".{PARTIAL_SUFFIX}"))
+            || name.ends_with(&format!(".{LEGACY_PARTIAL_SUFFIX}"))
+            || name.ends_with(&format!(".{SIDECAR_EXT}"))
+        {
+            continue;
+        }
+        let id = strip_segment_ext(name);
+        let id = match id {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => continue,
         };
@@ -160,9 +316,10 @@ pub fn list_segments(folder: &Path, video_id: &str) -> Result<Vec<Segment>> {
     Ok(out)
 }
 
-/// Find every `*.partial.mkv` under any Video's segments folder. Called on
-/// Course window open so the user can be offered the chance to import or
-/// discard captures that didn't survive a clean Stop.
+/// Find every partial file under any Video's segments folder — both the new
+/// `.partial.mov` shape and the legacy `.partial.mkv`. Called on Course
+/// window open so the user can be offered the chance to import or discard
+/// captures that didn't survive a clean Stop.
 pub fn scan_orphans(folder: &Path) -> Result<Vec<OrphanSegment>> {
     let videos_root = folder.join("videos");
     if !videos_root.is_dir() {
@@ -201,7 +358,8 @@ pub fn scan_orphans(folder: &Path) -> Result<Vec<OrphanSegment>> {
                 Some(n) => n,
                 None => continue,
             };
-            let id = match name.strip_suffix(&format!(".{PARTIAL_SUFFIX}")) {
+            let id = strip_partial_suffix(name);
+            let id = match id {
                 Some(s) if !s.is_empty() => s.to_string(),
                 _ => continue,
             };
@@ -216,6 +374,16 @@ pub fn scan_orphans(folder: &Path) -> Result<Vec<OrphanSegment>> {
     Ok(out)
 }
 
+fn strip_segment_ext(name: &str) -> Option<&str> {
+    name.strip_suffix(&format!(".{SEGMENT_EXT}"))
+        .or_else(|| name.strip_suffix(&format!(".{LEGACY_SEGMENT_EXT}")))
+}
+
+fn strip_partial_suffix(name: &str) -> Option<&str> {
+    name.strip_suffix(&format!(".{PARTIAL_SUFFIX}"))
+        .or_else(|| name.strip_suffix(&format!(".{LEGACY_PARTIAL_SUFFIX}")))
+}
+
 fn to_relative(folder: &Path, path: &Path) -> PathBuf {
     path.strip_prefix(folder).map(PathBuf::from).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -223,14 +391,30 @@ fn to_relative(folder: &Path, path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::capture::{
+        CompositionDefaults, Device, EndedReason, SegmentSidecar, SourceRole,
+    };
 
     fn course_folder() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
     }
 
-    /// Stand-in for the real ffmpeg remux: just copy bytes. The test doesn't
-    /// care that the output isn't a real MP4, only that finalize_segment
-    /// calls the remuxer, removes the partial, and returns the right path.
+    fn sample_sidecar() -> SegmentSidecar {
+        SegmentSidecar::new(
+            "take-1",
+            SourceRole::Screen,
+            Device {
+                id: "default".into(),
+                label: "Main Display".into(),
+            },
+            "2026-05-26T12:00:00Z",
+            CompositionDefaults::default(),
+            EndedReason::Normal,
+        )
+    }
+
+    /// Stand-in for the v1 ffmpeg remux on the legacy orphan path — just
+    /// copies bytes. Used by tests that exercise `.partial.mkv` adoption.
     fn copy_remux(src: &Path, dst: &Path) -> Result<()> {
         std::fs::copy(src, dst).map_err(|e| CoreError::Io {
             path: dst.to_path_buf(),
@@ -240,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_segment_path_creates_segments_dir_and_returns_partial_under_it() {
+    fn prepare_segment_path_creates_dir_and_returns_dot_partial_mov_under_it() {
         let f = course_folder();
         let (id, path) = prepare_segment_path(f.path(), "vid-1").unwrap();
 
@@ -251,6 +435,7 @@ mod tests {
 
         let name = path.file_name().unwrap().to_str().unwrap();
         assert_eq!(name, format!("{id}.{PARTIAL_SUFFIX}"));
+        assert!(name.ends_with(".partial.mov"));
     }
 
     #[test]
@@ -262,42 +447,31 @@ mod tests {
     }
 
     #[test]
-    fn finalize_segment_remuxes_partial_to_mp4_and_returns_relative_path() {
+    fn finalize_segment_renames_partial_to_mov_and_writes_sidecar() {
         let f = course_folder();
         let (id, partial) = prepare_segment_path(f.path(), "vid-1").unwrap();
-        std::fs::write(&partial, b"FAKE-MKV").unwrap();
+        std::fs::write(&partial, b"FAKE-MOV").unwrap();
 
-        let seg = finalize_segment(f.path(), "vid-1", &id, copy_remux).unwrap();
+        let seg = finalize_segment(f.path(), "vid-1", &id, sample_sidecar()).unwrap();
         assert_eq!(seg.id, id);
         assert_eq!(seg.video_id, "vid-1");
         assert_eq!(
             seg.path,
-            PathBuf::from("videos").join("vid-1").join("segments").join(format!("{id}.{SEGMENT_EXT}"))
+            PathBuf::from("videos")
+                .join("vid-1")
+                .join("segments")
+                .join(format!("{id}.{SEGMENT_EXT}"))
         );
 
-        assert!(!partial.exists(), "partial should be gone after remux");
-        assert!(f.path().join(&seg.path).is_file(), "final .mp4 should exist");
-    }
+        assert!(!partial.exists(), "partial should be gone after rename");
+        let final_path = f.path().join(&seg.path);
+        assert!(final_path.is_file(), "final .mov should exist");
+        // Content was rename, not re-encoded.
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"FAKE-MOV");
 
-    #[test]
-    fn finalize_segment_propagates_remux_failures_and_leaves_no_final_file() {
-        let f = course_folder();
-        let (id, partial) = prepare_segment_path(f.path(), "vid-1").unwrap();
-        std::fs::write(&partial, b"x").unwrap();
-        let final_path = f
-            .path()
-            .join("videos")
-            .join("vid-1")
-            .join("segments")
-            .join(format!("{id}.{SEGMENT_EXT}"));
-
-        let fail_remux = |_src: &Path, _dst: &Path| -> Result<()> {
-            Err(CoreError::Recorder("nope".into()))
-        };
-        let err = finalize_segment(f.path(), "vid-1", &id, fail_remux).unwrap_err();
-        assert!(matches!(err, CoreError::Recorder(_)));
-        assert!(partial.exists(), "partial must be preserved so the user can retry");
-        assert!(!final_path.exists(), "no half-finalised .mp4 should be left behind");
+        // Sidecar landed next to it.
+        let sidecar = read_sidecar(f.path(), "vid-1", &id).unwrap().unwrap();
+        assert_eq!(sidecar, sample_sidecar());
     }
 
     #[test]
@@ -305,24 +479,23 @@ mod tests {
         let f = course_folder();
         let (id, partial) = prepare_segment_path(f.path(), "vid-1").unwrap();
         std::fs::write(&partial, b"x").unwrap();
-        let _ = finalize_segment(f.path(), "vid-1", &id, copy_remux).unwrap();
+        let _ = finalize_segment(f.path(), "vid-1", &id, sample_sidecar()).unwrap();
 
-        // Calling again with the partial gone but the final present should
-        // not fail — Keep is a user-driven action and we don't want
-        // double-clicks or replays to error.
-        let seg = finalize_segment(f.path(), "vid-1", &id, copy_remux).unwrap();
+        // Replay Keep — the partial is gone, the final is in place. We
+        // accept this and rewrite the sidecar.
+        let seg = finalize_segment(f.path(), "vid-1", &id, sample_sidecar()).unwrap();
         assert_eq!(seg.id, id);
     }
 
     #[test]
     fn finalize_segment_errors_when_neither_partial_nor_final_exists() {
         let f = course_folder();
-        let result = finalize_segment(f.path(), "vid-1", "no-such-segment", copy_remux);
+        let result = finalize_segment(f.path(), "vid-1", "no-such-segment", sample_sidecar());
         assert!(matches!(result, Err(CoreError::SegmentNotFound(_))));
     }
 
     #[test]
-    fn discard_partial_removes_the_partial_file() {
+    fn discard_partial_removes_new_shape_partial() {
         let f = course_folder();
         let (id, partial) = prepare_segment_path(f.path(), "vid-1").unwrap();
         std::fs::write(&partial, b"x").unwrap();
@@ -332,10 +505,20 @@ mod tests {
     }
 
     #[test]
+    fn discard_partial_removes_legacy_partial_mkv_too() {
+        let f = course_folder();
+        let dir = segments_dir(f.path(), "vid-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join(format!("legacy-id.{LEGACY_PARTIAL_SUFFIX}"));
+        std::fs::write(&legacy, b"v1").unwrap();
+
+        discard_partial(f.path(), "vid-1", "legacy-id").unwrap();
+        assert!(!legacy.exists());
+    }
+
+    #[test]
     fn discard_partial_is_silent_when_file_is_already_missing() {
         let f = course_folder();
-        // Pretend a crash already cleaned things up — Discard should still
-        // succeed so the UI flow stays simple.
         discard_partial(f.path(), "vid-1", "ghost").unwrap();
     }
 
@@ -344,10 +527,10 @@ mod tests {
         let f = course_folder();
         let (id, partial) = prepare_segment_path(f.path(), "vid-1").unwrap();
         std::fs::write(&partial, b"x").unwrap();
-        let _ = finalize_segment(f.path(), "vid-1", &id, copy_remux).unwrap();
+        let _ = finalize_segment(f.path(), "vid-1", &id, sample_sidecar()).unwrap();
 
         discard_partial(f.path(), "vid-1", &id).unwrap();
-        let final_path = f.path().join("videos").join("vid-1").join("segments").join(format!("{id}.{SEGMENT_EXT}"));
+        let final_path = segments_dir(f.path(), "vid-1").join(format!("{id}.{SEGMENT_EXT}"));
         assert!(final_path.is_file(), "finalised file must be preserved");
     }
 
@@ -359,17 +542,18 @@ mod tests {
     }
 
     #[test]
-    fn list_segments_includes_finals_and_skips_partials_and_dotfiles() {
+    fn list_segments_includes_new_mov_finals_skips_partials_sidecars_and_dotfiles() {
         let f = course_folder();
         let (id_keep, p_keep) = prepare_segment_path(f.path(), "vid-1").unwrap();
         std::fs::write(&p_keep, b"x").unwrap();
-        let _ = finalize_segment(f.path(), "vid-1", &id_keep, copy_remux).unwrap();
+        let _ = finalize_segment(f.path(), "vid-1", &id_keep, sample_sidecar()).unwrap();
 
-        // A still-in-progress one and a dotfile that should be ignored.
+        // A still-in-progress one, a sidecar (the one we just wrote), and a
+        // dotfile that should all be ignored.
         let (_, p_partial) = prepare_segment_path(f.path(), "vid-1").unwrap();
         std::fs::write(&p_partial, b"x").unwrap();
         std::fs::write(
-            f.path().join("videos").join("vid-1").join("segments").join(".DS_Store"),
+            segments_dir(f.path(), "vid-1").join(".DS_Store"),
             b"x",
         )
         .unwrap();
@@ -380,31 +564,67 @@ mod tests {
     }
 
     #[test]
-    fn scan_orphans_finds_partials_across_all_video_folders() {
+    fn list_segments_picks_up_legacy_mp4_finals_for_v1_back_compat() {
         let f = course_folder();
-        let (id_a, pa) = prepare_segment_path(f.path(), "vid-1").unwrap();
-        std::fs::write(&pa, b"x").unwrap();
-        let (id_b, pb) = prepare_segment_path(f.path(), "vid-2").unwrap();
-        std::fs::write(&pb, b"x").unwrap();
+        let dir = segments_dir(f.path(), "vid-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("v1-id.mp4");
+        std::fs::write(&legacy, b"v1").unwrap();
 
-        // A finalised one in vid-1 — should NOT show up as an orphan.
-        let (id_c, pc) = prepare_segment_path(f.path(), "vid-1").unwrap();
-        std::fs::write(&pc, b"x").unwrap();
-        let _ = finalize_segment(f.path(), "vid-1", &id_c, copy_remux).unwrap();
+        let segs = list_segments(f.path(), "vid-1").unwrap();
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].id, "v1-id");
+        assert_eq!(
+            segs[0].path,
+            PathBuf::from("videos").join("vid-1").join("segments").join("v1-id.mp4")
+        );
+    }
+
+    #[test]
+    fn list_segments_returns_both_shapes_when_both_exist() {
+        let f = course_folder();
+        let dir = segments_dir(f.path(), "vid-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.mp4"), b"v1").unwrap();
+        std::fs::write(dir.join("b.mov"), b"v2").unwrap();
+
+        let ids: Vec<_> = list_segments(f.path(), "vid-1")
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn scan_orphans_finds_partial_mov_and_partial_mkv_across_videos() {
+        let f = course_folder();
+        let (id_new, p_new) = prepare_segment_path(f.path(), "vid-1").unwrap();
+        std::fs::write(&p_new, b"x").unwrap();
+
+        let dir_legacy = segments_dir(f.path(), "vid-2");
+        std::fs::create_dir_all(&dir_legacy).unwrap();
+        let legacy = dir_legacy.join(format!("legacy.{LEGACY_PARTIAL_SUFFIX}"));
+        std::fs::write(&legacy, b"v1").unwrap();
+
+        // Finalised segments must NOT show up as orphans.
+        let (id_done, p_done) = prepare_segment_path(f.path(), "vid-1").unwrap();
+        std::fs::write(&p_done, b"x").unwrap();
+        let _ = finalize_segment(f.path(), "vid-1", &id_done, sample_sidecar()).unwrap();
 
         let mut orphans = scan_orphans(f.path()).unwrap();
         orphans.sort_by(|a, b| a.id.cmp(&b.id));
-        let mut expected = vec![id_a.clone(), id_b.clone()];
+        let got_ids: Vec<_> = orphans.iter().map(|o| o.id.clone()).collect();
+        let mut expected = vec![id_new.clone(), "legacy".to_string()];
         expected.sort();
-        let got: Vec<_> = orphans.iter().map(|o| o.id.clone()).collect();
-        assert_eq!(got, expected);
+        assert_eq!(got_ids, expected);
 
-        // Each orphan path is relative to the course folder and points at a
-        // .partial.mkv file that still exists.
+        // Sanity-check the path shapes survived to the relative output.
         for o in &orphans {
             assert!(o.path.starts_with("videos"));
             assert!(f.path().join(&o.path).is_file());
-            assert!(o.path.to_string_lossy().ends_with(PARTIAL_SUFFIX));
+            let name = o.path.file_name().unwrap().to_str().unwrap();
+            assert!(name.ends_with(PARTIAL_SUFFIX) || name.ends_with(LEGACY_PARTIAL_SUFFIX));
         }
     }
 
@@ -413,5 +633,71 @@ mod tests {
         let f = course_folder();
         let orphans = scan_orphans(f.path()).unwrap();
         assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn write_then_read_sidecar_round_trips() {
+        let f = course_folder();
+        std::fs::create_dir_all(segments_dir(f.path(), "vid-1")).unwrap();
+        let s = sample_sidecar();
+        write_sidecar(f.path(), "vid-1", "seg-1", &s).unwrap();
+        let back = read_sidecar(f.path(), "vid-1", "seg-1").unwrap().unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn read_sidecar_returns_none_for_v1_segments_without_one() {
+        let f = course_folder();
+        std::fs::create_dir_all(segments_dir(f.path(), "vid-1")).unwrap();
+        // A v1 .mp4 with no sidecar — explicitly the "no sidecar" case.
+        std::fs::write(segments_dir(f.path(), "vid-1").join("v1.mp4"), b"x").unwrap();
+        let got = read_sidecar(f.path(), "vid-1", "v1").unwrap();
+        assert!(got.is_none(), "v1 segments without sidecars must not error");
+    }
+
+    #[test]
+    fn adopt_orphan_new_shape_renames_to_mov_and_writes_sidecar() {
+        let f = course_folder();
+        let (id, partial) = prepare_segment_path(f.path(), "vid-1").unwrap();
+        std::fs::write(&partial, b"recovered").unwrap();
+        let mut s = sample_sidecar();
+        s.ended_reason = EndedReason::Crashed;
+
+        let seg = adopt_orphan(f.path(), "vid-1", &id, s.clone(), |_, _| {
+            panic!("legacy remux must not run for new-shape orphans")
+        })
+        .unwrap();
+        assert!(seg.path.to_string_lossy().ends_with(".mov"));
+
+        let back = read_sidecar(f.path(), "vid-1", &id).unwrap().unwrap();
+        assert_eq!(back.ended_reason, EndedReason::Crashed);
+    }
+
+    #[test]
+    fn adopt_orphan_legacy_partial_mkv_remuxes_to_mp4_and_writes_no_sidecar() {
+        let f = course_folder();
+        let dir = segments_dir(f.path(), "vid-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy_partial = dir.join(format!("legacy-id.{LEGACY_PARTIAL_SUFFIX}"));
+        std::fs::write(&legacy_partial, b"v1-bytes").unwrap();
+
+        let seg = adopt_orphan(
+            f.path(),
+            "vid-1",
+            "legacy-id",
+            sample_sidecar(),
+            copy_remux,
+        )
+        .unwrap();
+
+        // v1 orphan adoption preserves v1 behaviour: produces a .mp4, no sidecar.
+        assert!(seg.path.to_string_lossy().ends_with(".mp4"));
+        assert!(!legacy_partial.exists());
+        let final_path = f.path().join(&seg.path);
+        assert!(final_path.is_file());
+        assert!(
+            read_sidecar(f.path(), "vid-1", "legacy-id").unwrap().is_none(),
+            "v1 orphan adoption deliberately does not write a sidecar (Phase 7 polish)"
+        );
     }
 }

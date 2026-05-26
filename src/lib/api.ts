@@ -166,6 +166,32 @@ export type PermissionsSnapshot = {
 
 export type SettingsPane = 'screenRecording' | 'camera' | 'microphone';
 
+/// The closed Source Role taxonomy from ADR-0002. Phase 1 only exercises
+/// Screen + Microphone; Window / Camera / SystemAudio land in Phase 2.
+export type SourceRole = 'screen' | 'window' | 'camera' | 'microphone' | 'systemAudio';
+
+export type Device = {
+  id: string;
+  label: string;
+};
+
+export type Position = { x: number; y: number };
+
+export type CompositionDefaults = {
+  position: Position;
+  scale: number;
+  opacity: number;
+  audioGainDb: number;
+};
+
+export type CaptureRequest = {
+  role: SourceRole;
+  device: Device;
+  defaults: CompositionDefaults;
+};
+
+/// v1 boolean trio retained as a UI-side view model only — translated into
+/// `CaptureRequest[]` before crossing the IPC boundary in `startRecording`.
 export type CaptureSources = {
   microphone: boolean;
   systemAudio: boolean;
@@ -186,7 +212,37 @@ export type SessionSnapshot = {
   segmentId: string;
   courseFolder: string;
   state: SessionState;
-  sources: CaptureSources;
+  takeId: string;
+  requests: CaptureRequest[];
+  recordedAt: string;
+};
+
+const defaultCompositionDefaults = (): CompositionDefaults => ({
+  position: { x: 0, y: 0 },
+  scale: 1,
+  opacity: 1,
+  audioGainDb: 0
+});
+
+/// Build the Phase 1 capture request list from the legacy boolean trio.
+/// Screen is always present; mic is added if the user toggled it on.
+/// systemAudio + webcam are tracked but produce no request yet (Phase 2).
+export const captureRequestsFromSources = (s: CaptureSources): CaptureRequest[] => {
+  const reqs: CaptureRequest[] = [
+    {
+      role: 'screen',
+      device: { id: 'default', label: 'Main Display' },
+      defaults: defaultCompositionDefaults()
+    }
+  ];
+  if (s.microphone) {
+    reqs.push({
+      role: 'microphone',
+      device: { id: 'default', label: 'Default Microphone' },
+      defaults: defaultCompositionDefaults()
+    });
+  }
+  return reqs;
 };
 
 export type Segment = {
@@ -206,12 +262,12 @@ export const openSettingsPane = (pane: SettingsPane) =>
 export const startRecording = (
   folder: string,
   videoId: string,
-  sources?: CaptureSources
+  requests: CaptureRequest[]
 ) =>
   invoke<SessionSnapshot>('start_recording', {
     folder,
     videoId,
-    sources: sources ?? null
+    requests
   });
 
 export const pauseRecording = (sessionId: string) =>

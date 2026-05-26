@@ -18,17 +18,24 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use courseforge_lib::core::capture::{CaptureRequest, CompositionDefaults, Device, SourceRole};
 use courseforge_lib::core::course;
 use courseforge_lib::core::edits;
-use courseforge_lib::core::permissions::CaptureSources;
 use courseforge_lib::core::transcript::Word;
 use courseforge_lib::export_manager::{ExportManager, ExportStatus};
 use courseforge_lib::exporter::fake::FakeExporter;
 use courseforge_lib::recorder::fake::FakeRecorderBackend;
 use courseforge_lib::recording_manager::RecordingManager;
-use courseforge_lib::remuxer::fake::FakeRemuxer;
 use courseforge_lib::transcriber::fake::{FakeTranscriberBackend, ScriptedResponse};
 use courseforge_lib::transcription_manager::TranscriptionManager;
+
+fn screen_request() -> CaptureRequest {
+    CaptureRequest {
+        role: SourceRole::Screen,
+        device: Device { id: "default".into(), label: "Main Display".into() },
+        defaults: CompositionDefaults::default(),
+    }
+}
 
 fn course_with_video() -> (tempfile::TempDir, PathBuf, String) {
     let root = tempfile::tempdir().unwrap();
@@ -39,10 +46,7 @@ fn course_with_video() -> (tempfile::TempDir, PathBuf, String) {
 }
 
 fn record_and_transcribe(folder: &Path, video_id: &str, words: Vec<Word>) -> PathBuf {
-    let rec = RecordingManager::new(
-        Box::new(FakeRecorderBackend::default()),
-        Box::new(FakeRemuxer::default()),
-    );
+    let rec = RecordingManager::new(Box::new(FakeRecorderBackend::default()));
     let backend = Arc::new(FakeTranscriberBackend::default());
     let shared = FakeTranscriberBackend {
         scripted: backend.scripted.clone(),
@@ -51,7 +55,7 @@ fn record_and_transcribe(folder: &Path, video_id: &str, words: Vec<Word>) -> Pat
     let tr = TranscriptionManager::new(Box::new(shared));
 
     let snap = rec
-        .start_session(folder, video_id, CaptureSources::default())
+        .start_session(folder, video_id, vec![screen_request()])
         .unwrap();
     rec.stop_session(&snap.id).unwrap();
     let seg = rec.keep_session(&snap.id).unwrap();

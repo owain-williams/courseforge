@@ -2,9 +2,10 @@ use std::path::PathBuf;
 use serde::Serialize;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use crate::core::{config, course, library, CoreError};
+use crate::core::capture::CaptureRequest;
 use crate::core::edits::{self, EditState};
 use crate::core::permissions::{
-    self, CaptureSources, PermissionsSnapshot, SettingsPane,
+    self, PermissionsSnapshot, SettingsPane,
 };
 use crate::core::segments::{self, OrphanSegment, Segment};
 use crate::core::transcript::{self, Transcript};
@@ -315,10 +316,9 @@ pub fn start_recording(
     manager: tauri::State<'_, RecordingManager>,
     folder: PathBuf,
     video_id: String,
-    sources: Option<CaptureSources>,
+    requests: Vec<CaptureRequest>,
 ) -> Result<SessionSnapshot, AppError> {
-    let sources = sources.unwrap_or_default();
-    Ok(manager.start_session(&folder, &video_id, sources)?)
+    Ok(manager.start_session(&folder, &video_id, requests)?)
 }
 
 #[tauri::command]

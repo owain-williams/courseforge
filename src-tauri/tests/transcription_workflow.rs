@@ -11,14 +11,21 @@
 
 use std::path::{Path, PathBuf};
 
+use courseforge_lib::core::capture::{CaptureRequest, CompositionDefaults, Device, SourceRole};
 use courseforge_lib::core::course;
-use courseforge_lib::core::permissions::CaptureSources;
 use courseforge_lib::core::transcript::{self, Word};
 use courseforge_lib::recorder::fake::FakeRecorderBackend;
 use courseforge_lib::recording_manager::RecordingManager;
 use courseforge_lib::transcriber::fake::{FakeTranscriberBackend, ScriptedResponse};
-use courseforge_lib::remuxer::fake::FakeRemuxer;
 use courseforge_lib::transcription_manager::{JobStatus, TranscriptionManager};
+
+fn screen_request() -> CaptureRequest {
+    CaptureRequest {
+        role: SourceRole::Screen,
+        device: Device { id: "default".into(), label: "Main Display".into() },
+        defaults: CompositionDefaults::default(),
+    }
+}
 
 fn course_with_video() -> (tempfile::TempDir, PathBuf, String) {
     let root = tempfile::tempdir().unwrap();
@@ -29,10 +36,7 @@ fn course_with_video() -> (tempfile::TempDir, PathBuf, String) {
 }
 
 fn fresh_recording_manager() -> RecordingManager {
-    RecordingManager::new(
-        Box::new(FakeRecorderBackend::default()),
-        Box::new(FakeRemuxer::default()),
-    )
+    RecordingManager::new(Box::new(FakeRecorderBackend::default()))
 }
 
 fn fresh_transcription_managers() -> (TranscriptionManager, std::sync::Arc<FakeTranscriberBackend>) {
@@ -51,7 +55,7 @@ fn keep_enqueues_transcription_and_writes_transcript_json_with_word_timestamps()
     let (transcribe, _) = fresh_transcription_managers();
 
     // Record → Keep, just like the IPC command does.
-    let snap = rec.start_session(&folder, &vid, CaptureSources::default()).unwrap();
+    let snap = rec.start_session(&folder, &vid, vec![screen_request()]).unwrap();
     rec.stop_session(&snap.id).unwrap();
     let course_folder_at_keep = snap.course_folder.clone();
     let video_id_at_keep = snap.video_id.clone();
@@ -81,7 +85,7 @@ fn transcript_remains_usable_after_copying_the_course_folder_to_another_location
     let rec = fresh_recording_manager();
     let (transcribe, _) = fresh_transcription_managers();
 
-    let snap = rec.start_session(&folder, &vid, CaptureSources::default()).unwrap();
+    let snap = rec.start_session(&folder, &vid, vec![screen_request()]).unwrap();
     rec.stop_session(&snap.id).unwrap();
     let _seg = rec.keep_session(&snap.id).unwrap();
     transcribe.enqueue(folder.clone(), vid.clone());
@@ -112,7 +116,7 @@ fn timestamps_align_with_playback_within_tolerance_for_a_known_clip() {
     let (transcribe, backend) = fresh_transcription_managers();
 
     // Drive a recording so a real Segment file exists.
-    let snap = rec.start_session(&folder, &vid, CaptureSources::default()).unwrap();
+    let snap = rec.start_session(&folder, &vid, vec![screen_request()]).unwrap();
     rec.stop_session(&snap.id).unwrap();
     let seg = rec.keep_session(&snap.id).unwrap();
     let seg_abs = folder.join(&seg.path);
@@ -145,7 +149,7 @@ fn transcription_failure_does_not_block_the_rest_of_the_video_and_is_retryable()
     let rec = fresh_recording_manager();
     let (transcribe, backend) = fresh_transcription_managers();
 
-    let snap = rec.start_session(&folder, &vid, CaptureSources::default()).unwrap();
+    let snap = rec.start_session(&folder, &vid, vec![screen_request()]).unwrap();
     rec.stop_session(&snap.id).unwrap();
     let seg = rec.keep_session(&snap.id).unwrap();
     let seg_abs = folder.join(&seg.path);

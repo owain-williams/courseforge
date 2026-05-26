@@ -388,27 +388,34 @@ fn read_duration_sec(path: &Path) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::capture::{CaptureRequest, CompositionDefaults, Device, SourceRole};
     use crate::core::edits;
-    use crate::core::permissions::CaptureSources;
     use crate::core::transcript::Word;
     use crate::exporter::fake::FakeExporter;
     use crate::recorder::fake::FakeRecorderBackend;
     use crate::recording_manager::RecordingManager;
-    use crate::remuxer::fake::FakeRemuxer;
     use crate::transcriber::fake::{FakeTranscriberBackend, ScriptedResponse};
     use crate::transcription_manager::TranscriptionManager;
+
+    fn screen_request() -> CaptureRequest {
+        CaptureRequest {
+            role: SourceRole::Screen,
+            device: Device {
+                id: "default".into(),
+                label: "Main Display".into(),
+            },
+            defaults: CompositionDefaults::default(),
+        }
+    }
 
     fn course_with_recorded_transcribed_video(words: Vec<Word>) -> (tempfile::TempDir, PathBuf, String) {
         let root = tempfile::tempdir().unwrap();
         let folder = crate::core::course::create_course(root.path(), "C").unwrap();
         let m = crate::core::course::add_module(&folder, "M").unwrap();
         let v = crate::core::course::add_video(&folder, &m.id, "V").unwrap();
-        let rec = RecordingManager::new(
-            Box::new(FakeRecorderBackend::default()),
-            Box::new(FakeRemuxer::default()),
-        );
+        let rec = RecordingManager::new(Box::new(FakeRecorderBackend::default()));
         let snap = rec
-            .start_session(&folder, &v.id, CaptureSources::default())
+            .start_session(&folder, &v.id, vec![screen_request()])
             .unwrap();
         rec.stop_session(&snap.id).unwrap();
         let seg = rec.keep_session(&snap.id).unwrap();

@@ -129,11 +129,10 @@ impl SettingsPane {
 
 /// macOS-backed checker. ScreenRecording is queried via CoreGraphics'
 /// `CGPreflightScreenCaptureAccess` (returns whether access is already
-/// granted, *without* prompting). Camera and Microphone status are not yet
-/// wired through — we report `Granted` optimistically and let the recorder
-/// surface a permission error if avfoundation refuses to open the device.
-/// The full TCC query for AV devices needs an ObjC bridge and is deliberately
-/// deferred to a follow-up alongside the ScreenCaptureKit migration.
+/// granted, *without* prompting). Camera and Microphone status come from
+/// `AVCaptureDevice.authorizationStatus(for:)` via `objc2`, so multi-source
+/// Start can fail precisely on the unauthorized device instead of partially
+/// starting and silently dropping it.
 #[cfg(target_os = "macos")]
 pub struct MacPermissionChecker;
 
@@ -141,6 +140,34 @@ pub struct MacPermissionChecker;
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
+}
+
+#[cfg(target_os = "macos")]
+fn permission_status_from_av(
+    status: objc2_av_foundation::AVAuthorizationStatus,
+) -> PermissionStatus {
+    use objc2_av_foundation::AVAuthorizationStatus;
+    match status {
+        AVAuthorizationStatus::Authorized => PermissionStatus::Granted,
+        AVAuthorizationStatus::Denied => PermissionStatus::Denied,
+        AVAuthorizationStatus::NotDetermined => PermissionStatus::NotDetermined,
+        AVAuthorizationStatus::Restricted => PermissionStatus::Restricted,
+        // AVAuthorizationStatus is `#[repr(transparent)]` over an NSInteger,
+        // so a future macOS could in principle hand us a value we don't
+        // know. Treat unknown as Denied — the safe default for capture.
+        _ => PermissionStatus::Denied,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn av_capture_status(media_type: &objc2_foundation::NSString) -> PermissionStatus {
+    // Safety: `authorizationStatusForMediaType` is a thread-safe class
+    // method that reads TCC state without prompting. The media-type pointer
+    // is a framework constant with `'static` lifetime.
+    let raw = unsafe {
+        objc2_av_foundation::AVCaptureDevice::authorizationStatusForMediaType(media_type)
+    };
+    permission_status_from_av(raw)
 }
 
 #[cfg(target_os = "macos")]
@@ -155,8 +182,19 @@ impl PermissionChecker for MacPermissionChecker {
                     PermissionStatus::Denied
                 }
             }
-            // See doc comment above — optimistic until we bridge ObjC.
-            Permission::Camera | Permission::Microphone => PermissionStatus::Granted,
+            Permission::Camera => {
+                // Safety: `AVMediaTypeVideo` is a framework-exported NSString
+                // constant; accessing it after AVFoundation is linked is sound.
+                let media = unsafe { objc2_av_foundation::AVMediaTypeVideo }
+                    .expect("AVMediaTypeVideo unavailable on this macOS");
+                av_capture_status(media)
+            }
+            Permission::Microphone => {
+                // Safety: same as Camera; `AVMediaTypeAudio` is a static constant.
+                let media = unsafe { objc2_av_foundation::AVMediaTypeAudio }
+                    .expect("AVMediaTypeAudio unavailable on this macOS");
+                av_capture_status(media)
+            }
         }
     }
 }
@@ -280,5 +318,48 @@ mod tests {
         );
         assert_eq!(SettingsPane::for_permission(Permission::Camera), SettingsPane::Camera);
         assert_eq!(SettingsPane::for_permission(Permission::Microphone), SettingsPane::Microphone);
+    }
+
+    /// Manual / on-device check: with Camera permission revoked for this
+    /// host process in System Settings → Privacy & Security → Camera, the
+    /// TCC bridge must surface `Denied` (not the legacy optimistic
+    /// `Granted`). Ignored by default because CI cannot revoke TCC; run
+    /// locally after revoking Camera with:
+    /// `cargo test -p courseforge -- --ignored mac_revoked_camera_reads_as_denied`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn mac_revoked_camera_reads_as_denied() {
+        let snap = PermissionsSnapshot::capture(&MacPermissionChecker);
+        assert_eq!(
+            snap.camera,
+            PermissionStatus::Denied,
+            "expected Camera to read as Denied; revoke Camera in System Settings before running",
+        );
+    }
+
+    /// Every value `AVAuthorizationStatus` is documented to return must land
+    /// in exactly one `PermissionStatus`. Anything else means the recorder
+    /// would either spin up against a denied device or refuse a granted one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn av_authorization_status_maps_each_variant() {
+        use objc2_av_foundation::AVAuthorizationStatus;
+        assert_eq!(
+            permission_status_from_av(AVAuthorizationStatus::Authorized),
+            PermissionStatus::Granted,
+        );
+        assert_eq!(
+            permission_status_from_av(AVAuthorizationStatus::Denied),
+            PermissionStatus::Denied,
+        );
+        assert_eq!(
+            permission_status_from_av(AVAuthorizationStatus::NotDetermined),
+            PermissionStatus::NotDetermined,
+        );
+        assert_eq!(
+            permission_status_from_av(AVAuthorizationStatus::Restricted),
+            PermissionStatus::Restricted,
+        );
     }
 }

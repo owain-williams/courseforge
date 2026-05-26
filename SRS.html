@@ -346,6 +346,7 @@
       <ol>
         <li><a href="#platform">Platform &amp; Stack</a></li>
         <li><a href="#data-model">Course Data Model</a></li>
+        <li><a href="#phases">Workflow Phases</a></li>
       </ol>
     </li>
     <li><a href="#functional">Functional Requirements</a>
@@ -374,8 +375,8 @@
   <p class="subtitle">A local-first macOS desktop app for solo course creators — ideate, record, edit, and export online video courses end to end.</p>
   <dl class="meta-grid">
     <dt>Document</dt>     <dd>SRS · high-level vision</dd>
-    <dt>Status</dt>       <dd>Draft v0.1 — for decomposition into per-feature design docs</dd>
-    <dt>Date</dt>         <dd>2026-05-24</dd>
+    <dt>Status</dt>       <dd>Draft v0.2 — multi-source recording, Tracks, Cuts, and Scenes folded in (see <code>docs/adr/0002</code>, <code>docs/adr/0003</code>)</dd>
+    <dt>Date</dt>         <dd>2026-05-26</dd>
     <dt>Owner</dt>        <dd>owain@andersdigital.com</dd>
   </dl>
 </header>
@@ -437,17 +438,27 @@
     <li><strong>Application framework:</strong> Tauri, with the application core written in Rust.</li>
     <li><strong>Persistence:</strong> Local filesystem. No required network services. No bundled server.</li>
     <li><strong>Credentials:</strong> AI provider keys are stored in the macOS Keychain.</li>
-    <li><strong>OS integration:</strong> Recording capabilities depend on macOS-native APIs (ScreenCaptureKit for screen and system audio, AVFoundation for camera and microphone). The app must request and respect the relevant macOS permissions (Screen Recording, Camera, Microphone).</li>
+    <li><strong>OS integration:</strong> Recording is implemented in-process via Rust↔Objective-C bindings to ScreenCaptureKit (screen, individual windows, system audio) and AVFoundation (camera, microphone), writing one <code>AVAssetWriter</code> output per source so that every captured Source Role lands in its own file. The shared <code>CMSampleBuffer</code> clock guarantees frame-accurate cross-source sync. The app must request and respect the relevant macOS permissions (Screen Recording, Camera, Microphone).</li>
   </ul>
 
   <h3 id="data-model">3.2 Course Data Model</h3>
   <p>The conceptual hierarchy is intentionally shallow:</p>
   <ul>
-    <li>A <strong>Course</strong> contains an ordered list of <strong>Modules</strong>.</li>
+    <li>A <strong>Course</strong> contains an ordered list of <strong>Modules</strong> and a course-wide list of reusable <strong>Scenes</strong> (capture presets).</li>
     <li>A <strong>Module</strong> contains an ordered list of <strong>Videos</strong>.</li>
-    <li>A <strong>Video</strong> is a timeline composed of one or more recorded <strong>Segments</strong> (and, once implemented, applied effects and transcript-edit decisions).</li>
+    <li>A <strong>Video</strong> is a multi-track timeline. It contains an ordered list of <strong>Tracks</strong> (video or audio); each Track holds <strong>Clips</strong>; each Clip references one <strong>Segment</strong> on disk and carries non-destructive placement and property values (position, scale, opacity, audio gain). Cuts on the Video timeline ripple across every overlapping Clip. Transcript decisions and effects layer on top.</li>
+    <li>A <strong>Segment</strong> is a single source's contiguous recording — one media file produced by one capture device or stream during one recording session. A multi-source recording session produces N peer Segments grouped by a shared <strong>Take</strong> id.</li>
   </ul>
-  <p>This two-level structure (Course → Module → Video) is fixed for v1. Deeper nesting (sub-modules, sections, lessons) is explicitly out of scope; users who need finer grouping can use additional top-level Modules. A richer hierarchy may be revisited later if real usage demands it.</p>
+  <p>This two-level course hierarchy (Course → Module → Video) is fixed for v1. Deeper nesting (sub-modules, sections, lessons) is explicitly out of scope; users who need finer grouping can use additional top-level Modules. A richer hierarchy may be revisited later if real usage demands it.</p>
+
+  <h3 id="phases">3.3 Workflow Phases</h3>
+  <p>A solo creator's work on a Video moves through four named phases. The UI surfaces them as distinct modes so the user always knows what they're doing. The phases are conceptual — every functional requirement in §4 sits in one of them.</p>
+  <ul>
+    <li><strong>Planning.</strong> Shaping the Course skeleton — Modules, Videos, titles, workflow state. No media exists yet. Covers FR-1.x, FR-2.x, FR-4.x.</li>
+    <li><strong>Capture.</strong> Producing Segments by recording, with a Scene selecting which sources to capture and how they're initially laid out. Ends when the user keeps an N-source Take. Covers FR-3.x.</li>
+    <li><strong>Assembly.</strong> Laying out captured Segments onto the Video's multi-track timeline. Auto-applied on Keep: the Scene's layout decides which Track each Segment lands on, where in time, and with what initial position / scale / opacity / audio gain. The user nudges from there.</li>
+    <li><strong>Editing.</strong> Refining a Video that's already assembled — transcript-driven cuts, per-Clip property tweaks, effects, export. Cuts and edits never modify Segments on disk. Covers FR-5.x, FR-6.x, FR-7.x.</li>
+  </ul>
 </section>
 
 <section id="functional">
@@ -475,13 +486,17 @@
   <h3 id="fr-recording">4.3 Recording</h3>
   <ol class="reqs">
     <li><span class="id">FR-3.1</span><p class="body">The user <strong>must</strong> be able to select a specific Video slot in the course skeleton and start a recording session that captures into that slot.</p></li>
-    <li><span class="id">FR-3.2</span><p class="body">A recording session <strong>must</strong> be able to capture any combination of: <strong>screen</strong> (full display or chosen window), <strong>webcam</strong>, <strong>microphone</strong>, and <strong>system audio</strong>.</p></li>
-    <li><span class="id">FR-3.3</span><p class="body">A single Video may contain multiple recorded Segments (e.g., a re-take, an inserted screencast, an outro recorded separately). The app <strong>must</strong> support appending additional Segments to an existing Video and reordering them.</p></li>
-    <li><span class="id">FR-3.4</span><p class="body">All recordings <strong>must</strong> be written to a crash-resilient container (target: <strong>Matroska / MKV</strong>) so that an interrupted recording remains playable and editable without manual repair.</p></li>
-    <li><span class="id">FR-3.5</span><p class="body">The user <strong>must</strong> be able to pause and resume a recording, and to abandon or keep a recording at the end of a session.</p></li>
-    <li><span class="id">FR-3.6</span><p class="body">The app <strong>must</strong> surface clear, actionable feedback when a recording cannot start because of a missing macOS permission (Screen Recording, Camera, or Microphone).</p></li>
+    <li><span class="id">FR-3.2</span><p class="body">A recording session <strong>must</strong> be able to capture any number of sources concurrently, drawn from a closed set of <strong>Source Roles</strong>: <code>screen</code> (a whole display), <code>window</code> (a specific app window), <code>camera</code> (any <code>AVCaptureDevice</code>, including built-in, USB, and Continuity Camera), <code>microphone</code>, and <code>system_audio</code>. Multiple sources of the same Role (e.g., two cameras) are permitted.</p></li>
+    <li><span class="id">FR-3.3</span><p class="body">Each captured source <strong>must</strong> be written to <strong>its own file</strong> on disk, with a sidecar JSON carrying its Source Role, the device identity, the capture wall-clock start, the shared <strong>Take</strong> id grouping the N peer Segments from one Record press, and the Scene-derived initial placement values.</p></li>
+    <li><span class="id">FR-3.4</span><p class="body">Cross-source sync <strong>must</strong> be frame-accurate — all sources in a Take share the macOS system clock at capture so that no per-source drift is introduced.</p></li>
+    <li><span class="id">FR-3.5</span><p class="body">A single Video may contain multiple recorded Takes (e.g., a re-take, an inserted screencast, an outro recorded separately). When a Take is kept, its Segments <strong>must</strong> be auto-arranged onto the Video's Tracks by Source Role: each new Segment appends to the matching Track at the end of the Video's existing timeline, creating a new Track if no matching one exists. The user can reorder, retime, or move Clips after the fact.</p></li>
+    <li><span class="id">FR-3.6</span><p class="body">The user <strong>must</strong> be able to define and save <strong>Scenes</strong> at the Course level — named, reusable presets that bind specific devices to Source Roles and define each source's initial position, scale, opacity, and audio gain on the Video frame. A Video may pin a default Scene; hitting Record uses that Scene, and the user may swap via "Record with…".</p></li>
+    <li><span class="id">FR-3.7</span><p class="body">Exactly one source per Scene <strong>must</strong> be markable as the <strong>Transcript Source</strong>. Only Segments produced by sources so marked are sent to transcription.</p></li>
+    <li><span class="id">FR-3.8</span><p class="body">Start <strong>must</strong> be atomic across all sources in the Scene: if any source fails to initialise (device missing, permission denied, content filter rejection), the entire Take aborts and any partial outputs are cleaned up. Mid-recording failure of one source <strong>must</strong> drop that source while the rest continue; the failed source's sidecar records the failure point.</p></li>
+    <li><span class="id">FR-3.9</span><p class="body">The user <strong>must</strong> be able to pause and resume a Take (atomic across all sources), and to discard or keep the Take at the end. Keep and Discard apply at the Take level — one decision applies to every Segment in the Take.</p></li>
+    <li><span class="id">FR-3.10</span><p class="body">A Take that did not survive a clean stop (app or OS crash mid-capture) <strong>must</strong> be recoverable on next launch. The app discovers orphaned outputs by Take id, groups them as a single Take, and offers Import or Discard for the whole Take.</p></li>
+    <li><span class="id">FR-3.11</span><p class="body">The app <strong>must</strong> surface clear, actionable feedback when a recording cannot start because of a missing macOS permission (Screen Recording, Camera, or Microphone), and <strong>must</strong> deep-link to the relevant Privacy &amp; Security pane.</p></li>
   </ol>
-  <div class="vnext"><strong>Multi-track</strong> recording (screen and webcam as independently editable streams) and <strong>picture-in-picture</strong> webcam overlay are explicit v-next goals. v1 records each enabled source but treats the recording as a single composited result for editing purposes.</div>
 
   <h3 id="fr-workflow">4.4 Workflow Tagging</h3>
   <ol class="reqs">
@@ -500,6 +515,8 @@
     <li><span class="id">FR-5.4</span><p class="body">All transcript-driven edits <strong>must</strong> be <strong>non-destructive</strong>: the original recorded Segments are never modified. Edits are stored as a list of cut/keep decisions and applied at playback and at export time.</p></li>
     <li><span class="id">FR-5.5</span><p class="body">The app <strong>must</strong> support unlimited undo and redo of transcript-driven edits within an editing session.</p></li>
     <li><span class="id">FR-5.6</span><p class="body">Transcripts <strong>must</strong> be persisted alongside their Videos as part of the course folder, so they remain available for re-editing, search, and caption export without re-running transcription.</p></li>
+    <li><span class="id">FR-5.7</span><p class="body">Transcripts <strong>must</strong> be stored per-Segment in the Segment's own source-time, and the Video-timeline view <strong>must</strong> be derived at read time from the current Clip placements (start, in-point, out-point, and active Cuts). Moving, retiming, or splitting Clips in Assembly does not require re-running transcription.</p></li>
+    <li><span class="id">FR-5.8</span><p class="body">Only Segments captured by a source marked as the <strong>Transcript Source</strong> on the Scene used to produce the Take <strong>must</strong> be transcribed. Captured audio from other sources (e.g., <code>system_audio</code>, a second mic not so marked) is excluded.</p></li>
   </ol>
 
   <h3 id="fr-effects">4.6 Effects &amp; Plugins</h3>
@@ -507,15 +524,17 @@
     <li><span class="id">FR-6.1</span><p class="body">The app <strong>must</strong> ship a built-in library of video and audio effects covering common course-production needs. The exact set is scoped per-feature, but the intended coverage includes: <em>skin smoothing</em>, <em>cursor zoom and highlight</em>, <em>transitions between segments</em>, <em>lower-thirds and text overlays</em>, <em>color filters / look adjustments</em>, and <em>background music with ducking</em>.</p></li>
     <li><span class="id">FR-6.2</span><p class="body">Effects <strong>must</strong> apply non-destructively as part of the Video's edit decision list and be re-orderable, adjustable, and removable.</p></li>
     <li><span class="id">FR-6.3</span><p class="body">The effects architecture <strong>should</strong> be designed with future third-party plugin support in mind. v1 does not ship a public plugin API.</p></li>
+    <li><span class="id">FR-6.4</span><p class="body">Per-Clip <strong>composition properties</strong> — <code>position</code>, <code>scale</code>, <code>opacity</code>, <code>visible</code>, and <code>audioGain</code> — are first-class non-destructive edit values, distinct from Effects. They are constant per Clip in v1 (no keyframes); changes are persisted to the EDL via the same atomic append-and-replay mechanism as transcript-driven cuts. <code>scale</code> is <strong>canvas-relative</strong> (<code>1.0</code> fills the Video's output frame); <code>audioGain</code> is expressed in <strong>dB</strong> (range −∞ to +12 dB, with 0 dB = recorded level).</p></li>
   </ol>
-  <div class="vnext">Third-party plugin support via an industry-standard host-agnostic video plugin format (target: an OpenFX-style standard, analogous to VST3 in audio) is an explicit v-next goal. v1 builds the in-app effect pipeline in a way that makes adopting such a standard later realistic.</div>
+  <div class="vnext">Third-party plugin support via an industry-standard host-agnostic video plugin format (target: an OpenFX-style standard, analogous to VST3 in audio) is an explicit v-next goal. v1 builds the in-app effect pipeline in a way that makes adopting such a standard later realistic. <strong>Keyframable</strong> composition properties (animating position/scale/opacity/audioGain over time) are also v-next; v1 carries a single constant value per Clip.</div>
 
   <h3 id="fr-export">4.7 Export</h3>
   <ol class="reqs">
     <li><span class="id">FR-7.1</span><p class="body">The user <strong>must</strong> be able to export each Video as a finished <strong>MP4</strong> file with all transcript-driven edits and effects applied.</p></li>
     <li><span class="id">FR-7.2</span><p class="body">The user <strong>must</strong> be able to export the whole Course as a bundle: the MP4 files organised on disk by Module and Video order, plus a manifest (JSON and/or CSV) describing the course structure, titles, descriptions, and per-video metadata. This bundle is intended to make bulk upload to an LMS less painful.</p></li>
     <li><span class="id">FR-7.3</span><p class="body">Each exported Video <strong>must</strong> have an accompanying <code>.srt</code> caption file derived from the (edited) transcript. The user <strong>should</strong> additionally be able to choose to burn captions into the video.</p></li>
-    <li><span class="id">FR-7.4</span><p class="body">The user <strong>must</strong> be able to preview an individual Video (with all edits and effects applied) inside the app before exporting it.</p></li>
+    <li><span class="id">FR-7.4</span><p class="body">The user <strong>must</strong> be able to preview an individual Video (with all edits and effects applied) inside the app before exporting it. The preview and the export <strong>must</strong> render through one shared composition model so that what the user sees in the editor is what lands in the exported file.</p></li>
+    <li><span class="id">FR-7.5</span><p class="body">Each Course <strong>must</strong> define a single output canvas (resolution and frame rate) used by every Video in the Course. The default is 1920×1080 at 30 fps; the user may change it in Course settings. Per-Clip <code>scale</code> and <code>position</code> values are interpreted in this canvas's coordinate space.</p></li>
   </ol>
   <div class="vnext">A whole-course preview / playthrough mode (watching the course end-to-end inside the app), and direct upload integrations to YouTube, Vimeo, Teachable, and similar destinations, are explicit v-next goals. SCORM, xAPI, and Common Cartridge LMS-export formats are out of scope unless a corporate-training audience becomes a stated target.</div>
 </section>
@@ -554,8 +573,14 @@
   <h2>7. v-next Roadmap</h2>
   <p>The following are named, deferred goals. They influence v1 architecture decisions (so that adopting them later is realistic) but are not v1 requirements.</p>
   <ul>
-    <li><strong>Multi-track recording</strong> — screen and webcam captured as independently editable streams.</li>
-    <li><strong>Picture-in-picture</strong> webcam overlay with repositioning and resizing at edit time.</li>
+    <li><strong>Keyframable composition properties</strong> — animating per-Clip position, scale, opacity, and audio gain over time (v1.5 carries a single constant value per Clip).</li>
+    <li><strong>Per-source Keep / Discard</strong> at the end of a Take, so the user can drop a bad angle without retaking. v1.5 resolves this in the editor by deleting unwanted Tracks.</li>
+    <li><strong>Media Bin</strong> — a per-Video library of captured Segments separate from the timeline, useful once external media (drag-in of an existing MP4) becomes a flow.</li>
+    <li><strong>Source Monitor</strong> — setting in/out points on a Segment before placing it on the timeline.</li>
+    <li><strong>Lift cuts</strong> — removing a span from the timeline without rippling the downstream Clips left. v1 cuts are always ripple.</li>
+    <li><strong>Linked Selection management UI</strong> — surfaced control of which Clips are linked beyond the default <code>takeId</code>-based linking (e.g., manual link of unrelated Clips, save/restore link groups).</li>
+    <li><strong>Markers and chapters</strong> on the Video timeline.</li>
+    <li><strong>Multicam editor</strong> — a dedicated view for switching between camera angles of the same Take during editing.</li>
     <li><strong>Persistent AI chat per course</strong> — an ongoing conversation that can read and modify the course skeleton.</li>
     <li><strong>Multi-provider AI</strong> — OpenAI, Gemini, local models, in addition to Anthropic.</li>
     <li><strong>Third-party effect plugins</strong> via an industry-standard host-agnostic format (target: OpenFX-style).</li>
@@ -579,7 +604,28 @@
     <dd>The exportable unit. A timeline composed of one or more recorded Segments plus non-destructive edit and effect decisions.</dd>
 
     <dt>Segment</dt>
-    <dd>A single contiguous recording. A Video contains one or more Segments arranged in order.</dd>
+    <dd>A single source's contiguous recording — one media file produced by one capture device or stream during one recording session. A Video references its Segments through Clips on Tracks; multi-source recording produces N peer Segments per Take.</dd>
+
+    <dt>Take</dt>
+    <dd>The N peer Segments captured together in one Record press, sharing a Take id and a wall-clock start. Take is the unit of Keep/Discard, orphan recovery, and default Clip linking in the editor.</dd>
+
+    <dt>Source Role</dt>
+    <dd>What a Segment is a recording <em>of</em>. Closed at five values: <code>screen</code>, <code>window</code>, <code>camera</code>, <code>microphone</code>, <code>system_audio</code>. Carried in each Segment's sidecar; multiple-of-the-same-Role per Take is permitted.</dd>
+
+    <dt>Scene</dt>
+    <dd>A named, reusable capture preset at the Course level — an ordered list of Source Roles bound to specific devices, plus each source's initial composition properties on the Video frame. A Video can pin a default Scene; the Scene's layout is what auto-arranges captured Segments at the start of Assembly.</dd>
+
+    <dt>Track</dt>
+    <dd>A persistent row on a Video's timeline that holds one or more Clips. Tracks have a kind (<code>video</code> or <code>audio</code>), an order, and per-Track metadata (name, lock, solo, mute).</dd>
+
+    <dt>Clip</dt>
+    <dd>A placement of a Segment on a Track — carrying placement (<code>startOnTimeline</code>, <code>inPoint</code>, <code>outPoint</code>) and composition properties (<code>position</code>, <code>scale</code>, <code>opacity</code>, <code>audioGain</code>, <code>visible</code>). Multiple Clips may reference the same Segment.</dd>
+
+    <dt>Linked Clips</dt>
+    <dd>Clips sharing a Take id are linked by default — selecting or moving one moves all, preserving the frame-accurate sync captured at recording. The user can explicitly <strong>Unlink</strong> when they want to drift sources apart.</dd>
+
+    <dt>Cut</dt>
+    <dd>A time range on the Video's assembled timeline that is dropped at render time, ripple-style — downstream Clips slide left to close the gap. A Cut applies to every Clip overlapping its span.</dd>
 
     <dt>Workflow state</dt>
     <dd>A user-defined label indicating where a Video is in the creator's personal production process (e.g., <em>Needs Recording</em>, <em>Needs Editing</em>).</dd>
@@ -600,7 +646,7 @@
     <dd>Bring-your-own-key. The user supplies their own AI provider API credentials; Courseforge never proxies or charges for AI usage.</dd>
 
     <dt>MKV</dt>
-    <dd>Matroska container format. Chosen for in-progress recordings because it remains playable and recoverable when writing is interrupted, unlike MP4.</dd>
+    <dd>Matroska container format. Historical: used by the v1 ffmpeg-child recorder as a crash-resilient intermediate before remux to MP4. Superseded by direct AVAssetWriter <code>.mov</code> output once the in-process ScreenCaptureKit recorder lands (see ADR-0002); existing v1 Course Folders with <code>.partial.mkv</code> orphans remain importable.</dd>
 
     <dt>MP4</dt>
     <dd>The export container format. Used because it is the universally accepted format for downstream platforms (YouTube, LMSs, etc.).</dd>

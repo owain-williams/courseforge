@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use crate::core::{config, course, library, CoreError};
+use crate::core::edits::{self, EditState};
 use crate::core::permissions::{
     self, CaptureSources, PermissionsSnapshot, SettingsPane,
 };
@@ -436,4 +437,33 @@ pub fn retry_transcription(
 #[tauri::command]
 pub fn get_transcript(folder: PathBuf, video_id: String) -> Result<Option<Transcript>, AppError> {
     Ok(transcript::read_transcript(&folder, &video_id)?)
+}
+
+// ---------------------------------------------------------------------------
+// Transcript-driven edits (EDL)
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn get_edit_state(folder: PathBuf, video_id: String) -> Result<EditState, AppError> {
+    Ok(edits::current_state(&folder, &video_id)?)
+}
+
+#[tauri::command]
+pub fn add_cut(
+    folder: PathBuf,
+    video_id: String,
+    start_sec: f64,
+    end_sec: f64,
+) -> Result<EditState, AppError> {
+    Ok(edits::append_cut(&folder, &video_id, start_sec, end_sec)?)
+}
+
+#[tauri::command]
+pub fn undo_edit(folder: PathBuf, video_id: String) -> Result<EditState, AppError> {
+    Ok(edits::append_undo(&folder, &video_id)?)
+}
+
+#[tauri::command]
+pub fn redo_edit(folder: PathBuf, video_id: String) -> Result<EditState, AppError> {
+    Ok(edits::append_redo(&folder, &video_id)?)
 }

@@ -37,6 +37,10 @@
     listTranscriptionJobs,
     retryTranscription,
     getTranscript,
+    getEditState,
+    addCut,
+    undoEdit,
+    redoEdit,
     type Course,
     type Module,
     type Video,
@@ -48,6 +52,8 @@
     type CaptureSources,
     type Transcript,
     type TranscriptionJob,
+    type EditState,
+    type Cut,
     formatError
   } from '$lib/api';
 
@@ -608,6 +614,12 @@
   let videoEl = $state<HTMLVideoElement | null>(null);
   let activeWordIndex = $state<number>(-1);
 
+  // Transcript-driven edits (issue #9): per-Video EDL plus a transient
+  // word-range selection that "Cut" or Delete acts on.
+  let editStateByVideo = $state<Record<string, EditState>>({});
+  let selectionAnchorByVideo = $state<Record<string, number | null>>({});
+  let selectionHeadByVideo = $state<Record<string, number | null>>({});
+
   async function refreshJobs() {
     try {
       const list = await listTranscriptionJobs();
@@ -629,6 +641,120 @@
     }
   }
 
+  async function loadEditState(videoId: string) {
+    if (!folder) return;
+    try {
+      const s = await getEditState(folder, videoId);
+      editStateByVideo = { ...editStateByVideo, [videoId]: s };
+    } catch (e) {
+      console.warn('getEditState failed', e);
+    }
+  }
+
+  function selectionRangeFor(videoId: string): [number, number] | null {
+    const a = selectionAnchorByVideo[videoId];
+    const h = selectionHeadByVideo[videoId];
+    if (a == null || h == null) return null;
+    return a <= h ? [a, h] : [h, a];
+  }
+
+  function isWordSelected(videoId: string, idx: number): boolean {
+    const range = selectionRangeFor(videoId);
+    if (!range) return false;
+    return idx >= range[0] && idx <= range[1];
+  }
+
+  function isWordCut(videoId: string, w: { start: number; end: number }): boolean {
+    const cuts = editStateByVideo[videoId]?.cuts ?? [];
+    return cuts.some((c) => w.start >= c.startSec && w.end <= c.endSec);
+  }
+
+  function setSelectionAnchor(videoId: string, idx: number) {
+    selectionAnchorByVideo = { ...selectionAnchorByVideo, [videoId]: idx };
+    selectionHeadByVideo = { ...selectionHeadByVideo, [videoId]: idx };
+  }
+
+  function extendSelection(videoId: string, idx: number) {
+    if (selectionAnchorByVideo[videoId] == null) {
+      setSelectionAnchor(videoId, idx);
+      return;
+    }
+    selectionHeadByVideo = { ...selectionHeadByVideo, [videoId]: idx };
+  }
+
+  function clearSelection(videoId: string) {
+    selectionAnchorByVideo = { ...selectionAnchorByVideo, [videoId]: null };
+    selectionHeadByVideo = { ...selectionHeadByVideo, [videoId]: null };
+  }
+
+  // Triple-click convenience: expand the current word's neighbours forward
+  // and backward until a sentence boundary. v1 boundary = trailing
+  // `.` / `?` / `!` on the rendered word text — good enough for English
+  // whisper output, which keeps punctuation glued to the preceding word.
+  function selectSentenceAt(videoId: string, idx: number) {
+    const t = transcriptByVideo[videoId];
+    if (!t) return;
+    const isBoundary = (text: string) => /[.!?]\s*$/.test(text);
+    let start = idx;
+    while (start > 0 && !isBoundary(t.words[start - 1].text)) start--;
+    let end = idx;
+    while (end < t.words.length - 1 && !isBoundary(t.words[end].text)) end++;
+    selectionAnchorByVideo = { ...selectionAnchorByVideo, [videoId]: start };
+    selectionHeadByVideo = { ...selectionHeadByVideo, [videoId]: end };
+  }
+
+  async function cutSelection(videoId: string) {
+    if (!folder) return;
+    const range = selectionRangeFor(videoId);
+    if (!range) return;
+    const t = transcriptByVideo[videoId];
+    if (!t) return;
+    const start = t.words[range[0]].start;
+    const end = t.words[range[1]].end;
+    if (!(end > start)) return;
+    try {
+      const next = await addCut(folder, videoId, start, end);
+      editStateByVideo = { ...editStateByVideo, [videoId]: next };
+      clearSelection(videoId);
+    } catch (e) {
+      error = formatError(e);
+    }
+  }
+
+  async function undoFor(videoId: string) {
+    if (!folder) return;
+    try {
+      const next = await undoEdit(folder, videoId);
+      editStateByVideo = { ...editStateByVideo, [videoId]: next };
+    } catch (e) {
+      error = formatError(e);
+    }
+  }
+
+  async function redoFor(videoId: string) {
+    if (!folder) return;
+    try {
+      const next = await redoEdit(folder, videoId);
+      editStateByVideo = { ...editStateByVideo, [videoId]: next };
+    } catch (e) {
+      error = formatError(e);
+    }
+  }
+
+  function onWordClick(e: MouseEvent, videoId: string, idx: number, w: { start: number }) {
+    // Triple-click → whole sentence; shift → extend; otherwise single-word
+    // select. We always jump the playhead to the clicked word so the user
+    // gets transport feedback alongside selection.
+    if (e.detail >= 3) {
+      selectSentenceAt(videoId, idx);
+    } else if (e.shiftKey) {
+      extendSelection(videoId, idx);
+    } else {
+      setSelectionAnchor(videoId, idx);
+    }
+    jumpToWord(w);
+  }
+
   function applyJob(job: TranscriptionJob) {
     jobsByVideo = { ...jobsByVideo, [job.videoId]: job };
     if (job.status.kind === 'done') {
@@ -637,6 +763,23 @@
       // Also refresh segments in case Keep just transitioned us here.
       void refreshSegments(job.videoId);
     }
+  }
+
+  // EDL-aware playback: when the playhead enters a cut region, jump to its
+  // end. Linear scan is fine — cut counts stay small per Video (FR-5.4 is
+  // about decisions, not raw frames). The transcript active-word lookup
+  // already runs each ontimeupdate, so we piggyback there.
+  function applyEdlSkip(videoId: string): boolean {
+    if (!videoEl) return false;
+    const cuts = editStateByVideo[videoId]?.cuts ?? [];
+    const now = videoEl.currentTime;
+    for (const c of cuts) {
+      if (now >= c.startSec && now < c.endSec) {
+        videoEl.currentTime = c.endSec;
+        return true;
+      }
+    }
+    return false;
   }
 
   async function retryFor(videoId: string) {
@@ -652,13 +795,16 @@
     if (openVideoId === videoId) {
       openVideoId = null;
       activeWordIndex = -1;
+      clearSelection(videoId);
       return;
     }
     openVideoId = videoId;
     activeWordIndex = -1;
+    clearSelection(videoId);
     if (!(videoId in transcriptByVideo)) {
       await loadTranscript(videoId);
     }
+    await loadEditState(videoId);
   }
 
   function firstSegmentSrc(videoId: string): string | null {
@@ -670,11 +816,13 @@
     return convertFileSrc(abs);
   }
 
-  function onTimeUpdate(t: Transcript | null | undefined) {
-    if (!t || !videoEl) return;
+  function onTimeUpdate(t: Transcript | null | undefined, videoId: string) {
+    if (!videoEl) return;
+    // Skip cuts first — if we jump the playhead the next ontimeupdate will
+    // refresh the active-word highlight, so don't bother computing it now.
+    if (applyEdlSkip(videoId)) return;
+    if (!t) return;
     const now = videoEl.currentTime;
-    // Linear scan is fine for typical Video lengths; binary search if we ever
-    // care about 30-minute talks with thousands of words.
     let idx = -1;
     for (let i = 0; i < t.words.length; i++) {
       if (now >= t.words[i].start && now < t.words[i].end) {
@@ -683,6 +831,45 @@
       }
     }
     if (idx !== activeWordIndex) activeWordIndex = idx;
+  }
+
+  // Keyboard transport on the open video panel. JKL-style shuttle: J jumps
+  // back, K toggles play/pause, L jumps forward; Space is an alias for K
+  // (NFR-7). Cmd+Z / Cmd+Shift+Z drive undo/redo on the EDL.
+  function onPanelKeydown(e: KeyboardEvent, videoId: string) {
+    // Don't hijack typing into form controls inside the panel.
+    const tgt = e.target as HTMLElement | null;
+    if (tgt && (tgt.tagName === 'INPUT' || tgt.tagName === 'TEXTAREA' || tgt.isContentEditable)) {
+      return;
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
+      e.preventDefault();
+      if (e.shiftKey) void redoFor(videoId);
+      else void undoFor(videoId);
+      return;
+    }
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      if (selectionRangeFor(videoId)) {
+        e.preventDefault();
+        void cutSelection(videoId);
+      }
+      return;
+    }
+    if (!videoEl) return;
+    if (e.key === ' ' || e.key.toLowerCase() === 'k') {
+      e.preventDefault();
+      if (videoEl.paused) void videoEl.play();
+      else videoEl.pause();
+    } else if (e.key.toLowerCase() === 'j') {
+      e.preventDefault();
+      videoEl.currentTime = Math.max(0, videoEl.currentTime - 5);
+    } else if (e.key.toLowerCase() === 'l') {
+      e.preventDefault();
+      videoEl.currentTime = Math.min(
+        videoEl.duration || videoEl.currentTime + 5,
+        videoEl.currentTime + 5
+      );
+    }
   }
 
   function jumpToWord(w: { start: number }) {
@@ -1174,7 +1361,14 @@
                     {@const src = firstSegmentSrc(v.id)}
                     {@const t = transcriptByVideo[v.id]}
                     {@const job = jobsByVideo[v.id]}
-                    <li class="video-panel">
+                    {@const edl = editStateByVideo[v.id]}
+                    {@const hasSelection = !!selectionRangeFor(v.id)}
+                    <!-- svelte-ignore a11y_no_noninteractive_element_interactions, a11y_no_noninteractive_tabindex -->
+                    <li
+                      class="video-panel"
+                      tabindex="0"
+                      onkeydown={(e) => onPanelKeydown(e, v.id)}
+                    >
                       <div class="player-col">
                         {#if src}
                           <!-- svelte-ignore a11y_media_has_caption -->
@@ -1184,7 +1378,7 @@
                             src={src}
                             controls
                             preload="metadata"
-                            ontimeupdate={() => onTimeUpdate(t)}
+                            ontimeupdate={() => onTimeUpdate(t, v.id)}
                           ></video>
                         {:else}
                           <div class="player-empty">No recorded Segment to play.</div>
@@ -1212,13 +1406,38 @@
                             <button class="link" onclick={() => retryFor(v.id)}>Retry</button>
                           </div>
                         {:else if t && t.words.length > 0}
+                          <div class="edit-toolbar">
+                            <button
+                              class="primary cut-btn"
+                              disabled={!hasSelection}
+                              onclick={() => cutSelection(v.id)}
+                              title="Delete the selected words and add a cut to the EDL"
+                            >Cut</button>
+                            <button
+                              class="ghost"
+                              disabled={!edl?.canUndo}
+                              onclick={() => undoFor(v.id)}
+                              title="Undo (⌘Z)"
+                            >Undo</button>
+                            <button
+                              class="ghost"
+                              disabled={!edl?.canRedo}
+                              onclick={() => redoFor(v.id)}
+                              title="Redo (⇧⌘Z)"
+                            >Redo</button>
+                            <span class="cut-hint">
+                              {edl?.cuts.length ?? 0} cut{(edl?.cuts.length ?? 0) === 1 ? '' : 's'}
+                            </span>
+                          </div>
                           <p class="transcript-words" aria-label="Transcript">
                             {#each t.words as w, i (i)}
                               <button
                                 class="word"
                                 class:active={activeWordIndex === i}
-                                onclick={() => jumpToWord(w)}
-                                title={`${w.start.toFixed(2)}s`}
+                                class:selected={isWordSelected(v.id, i)}
+                                class:cut={isWordCut(v.id, w)}
+                                onclick={(e) => onWordClick(e, v.id, i, w)}
+                                title={`${w.start.toFixed(2)}s — click to select, shift-click to extend, triple-click for sentence`}
                               >{w.text}</button>
                             {/each}
                           </p>
@@ -1853,5 +2072,46 @@
   .word.active {
     background: #0066ff;
     color: white;
+  }
+  .word.selected {
+    background: #ffe79a;
+    color: #4a3500;
+  }
+  .word.selected.active {
+    background: #f5b800;
+    color: #2a1f00;
+  }
+  .word.cut {
+    text-decoration: line-through;
+    color: #999;
+  }
+  .word.cut:hover { background: #f5f5f5; }
+
+  /* Edit toolbar above the transcript */
+  .edit-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin-bottom: 0.5rem;
+  }
+  .edit-toolbar .cut-btn {
+    padding: 0.3rem 0.7rem;
+    font-size: 0.8rem;
+  }
+  .edit-toolbar .ghost {
+    padding: 0.3rem 0.7rem;
+    font-size: 0.8rem;
+  }
+  .cut-hint {
+    margin-left: auto;
+    font-size: 0.75rem;
+    color: #888;
+  }
+
+  /* Focusable video panel — give it a subtle hint when focused so
+     keyboard transport users know it's listening. */
+  li.video-panel:focus-visible {
+    outline: 2px solid #99baff;
+    outline-offset: -2px;
   }
 </style>

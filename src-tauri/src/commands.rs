@@ -7,6 +7,8 @@ use crate::core::edits::{self, EditState};
 use crate::core::permissions::{
     self, PermissionsSnapshot, SettingsPane,
 };
+use crate::core::scenes::{self, Scene, SceneSource};
+use crate::core::capture::SourceRole;
 use crate::core::segments::{self, OrphanSegment, Segment};
 use crate::core::transcript::{self, Transcript};
 use crate::export_manager::{ExportJob, ExportManager};
@@ -415,6 +417,57 @@ pub fn discard_orphan_segment(
     segment_id: String,
 ) -> Result<(), AppError> {
     Ok(segments::discard_partial(&folder, &video_id, &segment_id)?)
+}
+
+// ---------------------------------------------------------------------------
+// Scenes
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn list_scenes(folder: PathBuf) -> Result<Vec<Scene>, AppError> {
+    Ok(scenes::list_scenes(&folder)?)
+}
+
+#[tauri::command]
+pub fn create_scene(folder: PathBuf, name: String) -> Result<Scene, AppError> {
+    Ok(scenes::create_scene(&folder, &name)?)
+}
+
+#[tauri::command]
+pub fn rename_scene(
+    folder: PathBuf,
+    scene_id: String,
+    new_name: String,
+) -> Result<(), AppError> {
+    Ok(scenes::rename_scene(&folder, &scene_id, &new_name)?)
+}
+
+#[tauri::command]
+pub fn duplicate_scene(folder: PathBuf, scene_id: String) -> Result<Scene, AppError> {
+    Ok(scenes::duplicate_scene(&folder, &scene_id)?)
+}
+
+#[tauri::command]
+pub fn delete_scene(folder: PathBuf, scene_id: String) -> Result<(), AppError> {
+    Ok(scenes::delete_scene(&folder, &scene_id)?)
+}
+
+#[tauri::command]
+pub fn add_scene_source(
+    folder: PathBuf,
+    scene_id: String,
+    role: SourceRole,
+) -> Result<SceneSource, AppError> {
+    Ok(scenes::add_scene_source(&folder, &scene_id, role)?)
+}
+
+#[tauri::command]
+pub fn remove_scene_source(
+    folder: PathBuf,
+    scene_id: String,
+    source_index: usize,
+) -> Result<(), AppError> {
+    Ok(scenes::remove_scene_source(&folder, &scene_id, source_index)?)
 }
 
 // ---------------------------------------------------------------------------

@@ -34,6 +34,15 @@
     scanOrphanSegments,
     importOrphanSegment,
     discardOrphanSegment,
+    listScenes,
+    createScene,
+    renameScene,
+    duplicateScene,
+    deleteScene,
+    addSceneSource,
+    removeSceneSource,
+    type Scene,
+    type SourceRole,
     listTranscriptionJobs,
     retryTranscription,
     getTranscript,
@@ -69,8 +78,157 @@
   let error = $state<string | null>(null);
   let busy = $state(false);
 
-  // Tree vs Board.
-  let view = $state<'tree' | 'board'>('tree');
+  // Tree vs Board vs Scenes.
+  let view = $state<'tree' | 'board' | 'scenes'>('tree');
+
+  // Scenes view state.
+  let scenes = $state<Scene[]>([]);
+  let scenesLoaded = $state(false);
+  let newSceneName = $state('');
+  let editingSceneId = $state<string | null>(null);
+  let editingSceneDraft = $state('');
+  // Per-Scene "add source" picker — keyed by sceneId so multiple Scenes can
+  // be open at once without their pickers stomping each other.
+  let addSourcePickerOpenForScene = $state<string | null>(null);
+
+  const ALL_SOURCE_ROLES: SourceRole[] = [
+    'screen',
+    'window',
+    'camera',
+    'microphone',
+    'systemAudio'
+  ];
+
+  function sourceRoleLabel(r: SourceRole): string {
+    switch (r) {
+      case 'screen':
+        return 'Screen';
+      case 'window':
+        return 'Window';
+      case 'camera':
+        return 'Camera';
+      case 'microphone':
+        return 'Microphone';
+      case 'systemAudio':
+        return 'System Audio';
+    }
+  }
+
+  async function loadScenes() {
+    if (!folder) return;
+    try {
+      scenes = await listScenes(folder);
+      scenesLoaded = true;
+    } catch (e) {
+      error = formatError(e);
+    }
+  }
+
+  async function openScenesView() {
+    view = 'scenes';
+    if (!scenesLoaded) await loadScenes();
+  }
+
+  async function submitNewScene() {
+    const name = newSceneName.trim();
+    if (!name || !folder) return;
+    busy = true;
+    try {
+      const s = await createScene(folder, name);
+      scenes = [...scenes, s];
+      newSceneName = '';
+    } catch (e) {
+      error = formatError(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  function startEditScene(s: Scene) {
+    editingSceneId = s.id;
+    editingSceneDraft = s.name;
+  }
+  function cancelEditScene() {
+    editingSceneId = null;
+    editingSceneDraft = '';
+  }
+  async function commitEditScene() {
+    const id = editingSceneId;
+    const name = editingSceneDraft.trim();
+    editingSceneId = null;
+    editingSceneDraft = '';
+    if (!id || !folder || !name) return;
+    busy = true;
+    try {
+      await renameScene(folder, id, name);
+      scenes = scenes.map((s) => (s.id === id ? { ...s, name } : s));
+    } catch (e) {
+      error = formatError(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function dupScene(s: Scene) {
+    if (!folder) return;
+    busy = true;
+    try {
+      const dup = await duplicateScene(folder, s.id);
+      const i = scenes.findIndex((x) => x.id === s.id);
+      scenes = [...scenes.slice(0, i + 1), dup, ...scenes.slice(i + 1)];
+    } catch (e) {
+      error = formatError(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function dropScene(s: Scene) {
+    if (!folder) return;
+    if (!confirm(`Delete Scene "${s.name}"?`)) return;
+    busy = true;
+    try {
+      await deleteScene(folder, s.id);
+      scenes = scenes.filter((x) => x.id !== s.id);
+    } catch (e) {
+      error = formatError(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function addSourceTo(s: Scene, role: SourceRole) {
+    if (!folder) return;
+    busy = true;
+    try {
+      const added = await addSceneSource(folder, s.id, role);
+      scenes = scenes.map((x) =>
+        x.id === s.id ? { ...x, sources: [...x.sources, added] } : x
+      );
+      addSourcePickerOpenForScene = null;
+    } catch (e) {
+      error = formatError(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function removeSourceAt(s: Scene, index: number) {
+    if (!folder) return;
+    busy = true;
+    try {
+      await removeSceneSource(folder, s.id, index);
+      scenes = scenes.map((x) =>
+        x.id === s.id
+          ? { ...x, sources: x.sources.filter((_, i) => i !== index) }
+          : x
+      );
+    } catch (e) {
+      error = formatError(e);
+    } finally {
+      busy = false;
+    }
+  }
 
   // Workflow state editor (modal-ish inline panel).
   let editingStates = $state(false);
@@ -1176,6 +1334,12 @@
           class:active={view === 'board'}
           onclick={() => (view = 'board')}
         >Board</button>
+        <button
+          role="tab"
+          aria-selected={view === 'scenes'}
+          class:active={view === 'scenes'}
+          onclick={openScenesView}
+        >Scenes</button>
       </div>
       <button class="ghost" onclick={openStateEditor} disabled={busy}>Edit States…</button>
     </section>
@@ -1640,7 +1804,7 @@
         {/each}
       </ol>
     {/if}
-    {:else}
+    {:else if view === 'board'}
       <!-- Board view: one column per workflow state, draggable Video cards. -->
       <section class="board" aria-label="Workflow board">
         {#each course.workflowStates as s (s.id)}
@@ -1679,6 +1843,101 @@
             </ul>
           </div>
         {/each}
+      </section>
+    {:else if view === 'scenes'}
+      <section class="scenes" aria-label="Scenes">
+        <form
+          class="new-form"
+          onsubmit={(e) => {
+            e.preventDefault();
+            void submitNewScene();
+          }}
+        >
+          <input
+            bind:value={newSceneName}
+            placeholder="Scene name (e.g. Talking Head)"
+          />
+          <button class="primary" type="submit" disabled={busy || !newSceneName.trim()}>
+            + Add Scene
+          </button>
+        </form>
+
+        {#if scenes.length === 0 && scenesLoaded}
+          <p class="empty">
+            No Scenes yet. A Scene is a named, reusable Capture preset — a list of
+            Source Roles (screen, camera, microphone, …) bound to specific devices.
+            Phase 2 slice 1 only handles the data; the device picker lands in
+            slice 2.
+          </p>
+        {/if}
+
+        <ol class="scenes-list">
+          {#each scenes as s (s.id)}
+            <li class="scene-row">
+              <header class="scene-header">
+                {#if editingSceneId === s.id}
+                  <input
+                    bind:value={editingSceneDraft}
+                    onblur={commitEditScene}
+                    onkeydown={(e) => {
+                      if (e.key === 'Enter') void commitEditScene();
+                      else if (e.key === 'Escape') cancelEditScene();
+                    }}
+                  />
+                {:else}
+                  <button class="title-btn" onclick={() => startEditScene(s)}>
+                    {s.name}
+                  </button>
+                {/if}
+                <div class="actions">
+                  <button class="ghost" disabled={busy} onclick={() => dupScene(s)}>
+                    Duplicate
+                  </button>
+                  <button class="ghost" disabled={busy} onclick={() => dropScene(s)}>
+                    Delete
+                  </button>
+                </div>
+              </header>
+
+              <ul class="source-chips" aria-label="Source roles for {s.name}">
+                {#each s.sources as src, i (i)}
+                  <li class="chip">
+                    <span class="chip-role">{sourceRoleLabel(src.role)}</span>
+                    <span class="chip-device" title={src.device.id}>{src.device.label}</span>
+                    <button
+                      class="chip-remove"
+                      aria-label="Remove source"
+                      disabled={busy}
+                      onclick={() => removeSourceAt(s, i)}
+                    >×</button>
+                  </li>
+                {/each}
+              </ul>
+
+              {#if addSourcePickerOpenForScene === s.id}
+                <div class="source-picker">
+                  {#each ALL_SOURCE_ROLES as role (role)}
+                    <button
+                      class="ghost"
+                      disabled={busy}
+                      onclick={() => addSourceTo(s, role)}
+                    >+ {sourceRoleLabel(role)}</button>
+                  {/each}
+                  <button
+                    class="ghost"
+                    onclick={() => (addSourcePickerOpenForScene = null)}
+                  >Cancel</button>
+                </div>
+              {:else}
+                <button
+                  class="ghost add-source"
+                  disabled={busy}
+                  onclick={() => (addSourcePickerOpenForScene = s.id)}
+                >+ Add Source</button>
+              {/if}
+            </li>
+          {/each}
+        </ol>
       </section>
     {/if}
   {/if}
@@ -2313,5 +2572,113 @@
   li.video-panel:focus-visible {
     outline: 2px solid #99baff;
     outline-offset: -2px;
+  }
+
+  /* Scenes view (Phase 2 slice 1 — issue #33). */
+  .scenes {
+    padding: 0 1rem 2rem;
+  }
+  .scenes .new-form {
+    display: flex;
+    gap: 0.5rem;
+    margin: 1rem 0;
+  }
+  .scenes .new-form input {
+    flex: 1;
+    max-width: 24rem;
+    padding: 0.4rem 0.6rem;
+    font-size: 0.95rem;
+  }
+  .scenes .empty {
+    color: #666;
+    max-width: 40rem;
+  }
+  .scenes-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+  .scene-row {
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 0.75rem;
+    background: #fafafa;
+  }
+  .scene-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+  }
+  .scene-header .title-btn {
+    flex: 1;
+    background: none;
+    border: none;
+    text-align: left;
+    font-weight: 600;
+    font-size: 1rem;
+    cursor: pointer;
+    padding: 0.1rem 0.2rem;
+  }
+  .scene-header .title-btn:hover {
+    background: #eef2ff;
+    border-radius: 3px;
+  }
+  .scene-header input {
+    flex: 1;
+    padding: 0.25rem 0.4rem;
+    font-size: 1rem;
+    font-weight: 600;
+  }
+  .scene-header .actions {
+    display: flex;
+    gap: 0.25rem;
+  }
+  .source-chips {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 0.5rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 999px;
+    padding: 0.15rem 0.5rem;
+    font-size: 0.85rem;
+  }
+  .chip-role {
+    font-weight: 600;
+  }
+  .chip-device {
+    color: #666;
+  }
+  .chip-remove {
+    background: none;
+    border: none;
+    color: #888;
+    cursor: pointer;
+    font-size: 1rem;
+    padding: 0 0.1rem;
+    line-height: 1;
+  }
+  .chip-remove:hover {
+    color: #c00;
+  }
+  .source-picker {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+  .add-source {
+    font-size: 0.85rem;
   }
 </style>

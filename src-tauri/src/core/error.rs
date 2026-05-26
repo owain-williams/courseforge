@@ -31,6 +31,23 @@ pub enum CoreError {
         source: serde_json::Error,
     },
 
+    #[error("invalid scenes.json at {path}: {source}")]
+    InvalidScenesJson {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("scene not found: {0}")]
+    SceneNotFound(String),
+
+    #[error("scene source index {index} out of bounds for scene {scene_id} (len {len})")]
+    SceneSourceIndexOutOfBounds {
+        scene_id: String,
+        index: usize,
+        len: usize,
+    },
+
     #[error("invalid cut: end ({end}) must be greater than start ({start})")]
     InvalidCut { start: f64, end: f64 },
 

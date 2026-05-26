@@ -304,6 +304,43 @@ export const discardOrphanSegment = (folder: string, videoId: string, segmentId:
   invoke<void>('discard_orphan_segment', { folder, videoId, segmentId });
 
 // ---------------------------------------------------------------------------
+// Scenes (Phase 2 — issue #33)
+// ---------------------------------------------------------------------------
+
+export type SceneSource = {
+  role: SourceRole;
+  device: Device;
+  defaults: CompositionDefaults;
+};
+
+export type Scene = {
+  id: string;
+  name: string;
+  sources: SceneSource[];
+};
+
+export const listScenes = (folder: string) =>
+  invoke<Scene[]>('list_scenes', { folder });
+
+export const createScene = (folder: string, name: string) =>
+  invoke<Scene>('create_scene', { folder, name });
+
+export const renameScene = (folder: string, sceneId: string, newName: string) =>
+  invoke<void>('rename_scene', { folder, sceneId, newName });
+
+export const duplicateScene = (folder: string, sceneId: string) =>
+  invoke<Scene>('duplicate_scene', { folder, sceneId });
+
+export const deleteScene = (folder: string, sceneId: string) =>
+  invoke<void>('delete_scene', { folder, sceneId });
+
+export const addSceneSource = (folder: string, sceneId: string, role: SourceRole) =>
+  invoke<SceneSource>('add_scene_source', { folder, sceneId, role });
+
+export const removeSceneSource = (folder: string, sceneId: string, sourceIndex: number) =>
+  invoke<void>('remove_scene_source', { folder, sceneId, sourceIndex });
+
+// ---------------------------------------------------------------------------
 // Transcription
 // ---------------------------------------------------------------------------
 

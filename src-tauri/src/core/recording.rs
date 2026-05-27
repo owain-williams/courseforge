@@ -209,6 +209,7 @@ mod tests {
                 label: "Main Display".into(),
             },
             defaults: CompositionDefaults::default(),
+            is_transcript_source: false,
         }
     }
 
@@ -252,6 +253,7 @@ mod tests {
                 role: SourceRole::Camera,
                 device: Device { id: "cam1".into(), label: "FaceTime".into() },
                 defaults: CompositionDefaults::default(),
+                is_transcript_source: false,
             },
         };
         let mic_slot = SegmentSlot {
@@ -261,6 +263,7 @@ mod tests {
                 role: SourceRole::Microphone,
                 device: Device { id: "default".into(), label: "Default".into() },
                 defaults: CompositionDefaults::default(),
+                is_transcript_source: false,
             },
         };
         let s = RecordingSession::new(

@@ -378,6 +378,11 @@ export type SceneSource = {
   role: SourceRole;
   device: Device;
   defaults: CompositionDefaults;
+  /// Issue #40 — radio-style flag (at most one per Scene). When true,
+  /// this source's audio is the Take's Transcript Source. v1 / pre-#40
+  /// Scenes deserialise this as undefined; the frontend treats that as
+  /// `false`.
+  isTranscriptSource?: boolean;
 };
 
 export type Scene = {
@@ -448,6 +453,20 @@ export const reorderSceneSource = (
     sceneId,
     fromIndex,
     toIndex
+  });
+
+/// Issue #40 — designate exactly one source row as the Take's Transcript
+/// Source. Every other row's flag is cleared in the same write. The
+/// target row must produce audio (`microphone` / `systemAudio`).
+export const setSceneTranscriptSource = (
+  folder: string,
+  sceneId: string,
+  sourceIndex: number
+) =>
+  invoke<SceneSource>('set_scene_transcript_source', {
+    folder,
+    sceneId,
+    sourceIndex
   });
 
 /// Live device enumeration per role (issue #34). Queries SCK /

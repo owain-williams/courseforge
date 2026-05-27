@@ -190,6 +190,7 @@ mod tests {
                     label: "Default".into(),
                 },
                 defaults: CompositionDefaults::default(),
+                is_transcript_source: false,
             },
             segment_id: segment_id.into(),
             partial_path: PathBuf::from(format!("/tmp/{segment_id}.partial.mov")),

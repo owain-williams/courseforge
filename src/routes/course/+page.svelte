@@ -50,6 +50,7 @@
     setSceneSourceDevice,
     setSceneSourceDefaults,
     reorderSceneSource,
+    setSceneTranscriptSource,
     listCaptureDevices,
     DEFAULT_DEVICE,
     type CompositionDefaults,
@@ -434,6 +435,31 @@
     if (!dragState) return;
     (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
     dragState = null;
+  }
+
+  async function pickTranscriptSource(s: Scene, sourceIndex: number) {
+    if (!folder) return;
+    busy = true;
+    try {
+      const updated = await setSceneTranscriptSource(folder, s.id, sourceIndex);
+      scenes = scenes.map((x) =>
+        x.id === s.id
+          ? {
+              ...x,
+              sources: x.sources.map((src, i) => ({
+                ...src,
+                isTranscriptSource: i === sourceIndex
+              }))
+            }
+          : x
+      );
+      // Keep the type-checker happy about the unused return.
+      void updated;
+    } catch (e) {
+      error = formatError(e);
+    } finally {
+      busy = false;
+    }
   }
 
   async function moveSourceRow(s: Scene, fromIndex: number, delta: number) {
@@ -2366,6 +2392,19 @@
                           <button class="ghost mute" onclick={() => flipMuted(s, i)}>
                             {d.audioGainDb === Number.NEGATIVE_INFINITY ? 'Unmute' : 'Mute'}
                           </button>
+                          <label
+                            class="transcript-source"
+                            title="The Take's Transcript Source — only this source's audio will be transcribed (Phase 6)."
+                          >
+                            <input
+                              type="radio"
+                              name="transcript-source-{s.id}"
+                              checked={!!src.isTranscriptSource}
+                              disabled={busy}
+                              onchange={() => pickTranscriptSource(s, i)}
+                            />
+                            Transcript
+                          </label>
                         </div>
                       {/if}
                     {/each}
@@ -3526,6 +3565,13 @@
   }
   .audio-chip .mute {
     font-size: 0.8rem;
+  }
+  .audio-chip .transcript-source {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.8rem;
+    color: #335;
   }
   .inspector {
     display: flex;

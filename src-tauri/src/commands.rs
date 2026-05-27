@@ -589,6 +589,19 @@ pub fn reorder_scene_source(
     )?)
 }
 
+#[tauri::command]
+pub fn set_scene_transcript_source(
+    folder: PathBuf,
+    scene_id: String,
+    source_index: usize,
+) -> Result<SceneSource, AppError> {
+    Ok(scenes::set_scene_transcript_source(
+        &folder,
+        &scene_id,
+        source_index,
+    )?)
+}
+
 // ---------------------------------------------------------------------------
 // Transcription
 // ---------------------------------------------------------------------------

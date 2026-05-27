@@ -34,6 +34,15 @@ pub struct SceneSource {
     pub device: Device,
     #[serde(default)]
     pub defaults: CompositionDefaults,
+    /// Issue #40 — Phase 6's Transcript Source designation. At most one
+    /// source per Scene may set this to `true`; the [`Scene`] CRUD layer
+    /// enforces that invariant when rows are added / mutated.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_transcript_source: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl SceneSource {
@@ -48,6 +57,7 @@ impl SceneSource {
                 label: "Default".into(),
             },
             defaults: CompositionDefaults::default(),
+            is_transcript_source: false,
         }
     }
 }
@@ -207,14 +217,57 @@ pub fn delete_scene(folder: &Path, scene_id: &str) -> Result<()> {
 }
 
 pub fn add_scene_source(folder: &Path, scene_id: &str, role: SourceRole) -> Result<SceneSource> {
-    let source = SceneSource::placeholder(role);
-    let out = source.clone();
+    let mut source = SceneSource::placeholder(role);
+    let mut out_holder: Option<SceneSource> = None;
     mutate_scenes(folder, |f| {
         let s = find_scene_mut(f, scene_id)?;
-        s.sources.push(source);
+        // Issue #40 default: a brand-new Microphone row in a Scene with
+        // no existing Transcript Source becomes the Transcript Source.
+        if role == SourceRole::Microphone
+            && !s.sources.iter().any(|r| r.is_transcript_source)
+        {
+            source.is_transcript_source = true;
+        }
+        s.sources.push(source.clone());
+        out_holder = Some(source);
         Ok(())
     })?;
-    Ok(out)
+    Ok(out_holder.expect("add_scene_source produced no row — bug"))
+}
+
+/// Designate exactly one source row as the Take's Transcript Source
+/// (issue #40). Every other row's flag is cleared in the same write —
+/// the Scene's invariant ("at most one Transcript Source") is what makes
+/// Phase 6's filter unambiguous.
+///
+/// The target row must produce audio. Visible camera rows are rejected
+/// here because Phase 2's recorder treats camera as video-only; pick a
+/// Microphone or SystemAudio row instead.
+pub fn set_scene_transcript_source(
+    folder: &Path,
+    scene_id: &str,
+    source_index: usize,
+) -> Result<SceneSource> {
+    mutate_scenes(folder, |f| {
+        let s = find_scene_mut(f, scene_id)?;
+        if source_index >= s.sources.len() {
+            return Err(CoreError::SceneSourceIndexOutOfBounds {
+                scene_id: scene_id.to_string(),
+                index: source_index,
+                len: s.sources.len(),
+            });
+        }
+        let role = s.sources[source_index].role;
+        if !role.is_audio_only() {
+            return Err(CoreError::Recorder(format!(
+                "transcript source must be an audio role (got {role:?}); pick a Microphone or System Audio row"
+            )));
+        }
+        for (i, src) in s.sources.iter_mut().enumerate() {
+            src.is_transcript_source = i == source_index;
+        }
+        Ok(s.sources[source_index].clone())
+    })
 }
 
 pub fn remove_scene_source(folder: &Path, scene_id: &str, source_index: usize) -> Result<()> {
@@ -356,6 +409,7 @@ pub fn build_capture_requests(
             role: src.role,
             device: src.device.clone(),
             defaults: src.defaults,
+            is_transcript_source: src.is_transcript_source,
         });
     }
     Ok(out)
@@ -652,6 +706,7 @@ mod tests {
                 role: SourceRole::Camera,
                 device: Device { id: "0xCAM01".into(), label: "FaceTime HD".into() },
                 defaults: CompositionDefaults::default(),
+                is_transcript_source: false,
             }],
         };
         let live = live_map([(
@@ -671,6 +726,7 @@ mod tests {
                 role: SourceRole::Camera,
                 device: Device { id: "0xUSB99".into(), label: "Logi Webcam".into() },
                 defaults: CompositionDefaults::default(),
+                is_transcript_source: false,
             }],
         };
         let live = live_map([(
@@ -704,6 +760,73 @@ mod tests {
         let live = live_map([]);
         let err = build_capture_requests(&scene, &live).unwrap_err();
         assert!(matches!(err, CoreError::SceneHasNoSources { .. }));
+    }
+
+    #[test]
+    fn adding_first_microphone_makes_it_the_transcript_source_by_default() {
+        let dir = tmp();
+        let s = create_scene(dir.path(), "A").unwrap();
+        let added = add_scene_source(dir.path(), &s.id, SourceRole::Microphone).unwrap();
+        assert!(added.is_transcript_source);
+        let list = list_scenes(dir.path()).unwrap();
+        assert!(list[0].sources[0].is_transcript_source);
+    }
+
+    #[test]
+    fn adding_a_second_microphone_does_not_steal_transcript_source_from_the_first() {
+        let dir = tmp();
+        let s = create_scene(dir.path(), "A").unwrap();
+        add_scene_source(dir.path(), &s.id, SourceRole::Microphone).unwrap();
+        add_scene_source(dir.path(), &s.id, SourceRole::Microphone).unwrap();
+        let list = list_scenes(dir.path()).unwrap();
+        assert!(list[0].sources[0].is_transcript_source);
+        assert!(!list[0].sources[1].is_transcript_source);
+    }
+
+    #[test]
+    fn screen_rows_dont_become_transcript_source_just_for_being_first() {
+        let dir = tmp();
+        let s = create_scene(dir.path(), "A").unwrap();
+        add_scene_source(dir.path(), &s.id, SourceRole::Screen).unwrap();
+        let list = list_scenes(dir.path()).unwrap();
+        assert!(!list[0].sources[0].is_transcript_source);
+    }
+
+    #[test]
+    fn set_scene_transcript_source_clears_every_other_audio_row() {
+        let dir = tmp();
+        let s = create_scene(dir.path(), "A").unwrap();
+        add_scene_source(dir.path(), &s.id, SourceRole::Screen).unwrap();
+        add_scene_source(dir.path(), &s.id, SourceRole::Microphone).unwrap();
+        add_scene_source(dir.path(), &s.id, SourceRole::SystemAudio).unwrap();
+        // First mic is the default transcript source. Switch to systemAudio.
+        set_scene_transcript_source(dir.path(), &s.id, 2).unwrap();
+        let list = list_scenes(dir.path()).unwrap();
+        let flags: Vec<bool> = list[0].sources.iter().map(|r| r.is_transcript_source).collect();
+        assert_eq!(flags, vec![false, false, true]);
+    }
+
+    #[test]
+    fn set_scene_transcript_source_rejects_non_audio_roles() {
+        let dir = tmp();
+        let s = create_scene(dir.path(), "A").unwrap();
+        add_scene_source(dir.path(), &s.id, SourceRole::Screen).unwrap();
+        let err = set_scene_transcript_source(dir.path(), &s.id, 0).unwrap_err();
+        assert!(matches!(err, CoreError::Recorder(_)));
+    }
+
+    #[test]
+    fn build_capture_requests_forwards_is_transcript_source_flag() {
+        let dir = tmp();
+        let s = create_scene(dir.path(), "A").unwrap();
+        add_scene_source(dir.path(), &s.id, SourceRole::Screen).unwrap();
+        add_scene_source(dir.path(), &s.id, SourceRole::Microphone).unwrap();
+        let scene = list_scenes(dir.path()).unwrap().into_iter().next().unwrap();
+        let reqs =
+            build_capture_requests(&scene, &std::collections::HashMap::new()).unwrap();
+        // Mic was added second and became the default transcript source.
+        assert!(!reqs[0].is_transcript_source);
+        assert!(reqs[1].is_transcript_source);
     }
 
     #[test]

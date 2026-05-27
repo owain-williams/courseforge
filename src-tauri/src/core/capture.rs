@@ -109,6 +109,16 @@ pub struct CaptureRequest {
     pub device: Device,
     #[serde(default)]
     pub defaults: CompositionDefaults,
+    /// Issue #40 — whether this source is the Scene's designated
+    /// Transcript Source. Defaults to `false` so v1 Course Folders and
+    /// pre-Phase-2 capture flows stay byte-identical. Phase 6 uses this
+    /// flag to filter which audio Segments get sent to the transcriber.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_transcript_source: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// How a Segment's recording ended. Written into the sidecar JSON so the
@@ -146,6 +156,13 @@ pub struct SegmentSidecar {
     pub recorded_at: String,
     pub defaults: CompositionDefaults,
     pub ended_reason: EndedReason,
+    /// Issue #40 — was this Segment captured from the Scene's Transcript
+    /// Source slot? Snapshotted at Capture time so Phase 6's transcriber
+    /// filter can decide without re-loading the Scene. Defaults to
+    /// `false` (omitted from JSON) so v1 Course Folders stay
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_transcript_source: bool,
     /// ISO-8601 UTC timestamp the source's recording ended. Issue #37
     /// records this on mid-Take per-source failure so the editor (and the
     /// user) can tell when one source dropped while the rest of the Take
@@ -174,8 +191,16 @@ impl SegmentSidecar {
             recorded_at: recorded_at.into(),
             defaults,
             ended_reason,
+            is_transcript_source: false,
             ended_at: None,
         }
+    }
+
+    /// Tag the sidecar as the Take's Transcript Source slot — Phase 6's
+    /// filter reads this back instead of re-loading the Scene.
+    pub fn with_transcript_source(mut self, flag: bool) -> Self {
+        self.is_transcript_source = flag;
+        self
     }
 
     /// Tag the sidecar with an explicit end timestamp — used for mid-Take
@@ -287,6 +312,7 @@ mod tests {
                 label: "Main Display".into(),
             },
             defaults: CompositionDefaults::default(),
+            is_transcript_source: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: CaptureRequest = serde_json::from_str(&json).unwrap();

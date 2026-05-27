@@ -151,6 +151,7 @@ mod tests {
                 label: "Default".into(),
             },
             defaults: CompositionDefaults::default(),
+            is_transcript_source: false,
         }
     }
 

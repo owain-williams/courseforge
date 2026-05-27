@@ -297,7 +297,8 @@ impl RecordingManager {
                 recorded_at.clone(),
                 slot.request.defaults,
                 ended_reason,
-            );
+            )
+            .with_transcript_source(slot.request.is_transcript_source);
             if let Some(ended_at) = ended_at {
                 sidecar = sidecar.with_ended_at(ended_at);
             }
@@ -645,6 +646,7 @@ mod tests {
                 label: "Main Display".into(),
             },
             defaults: CompositionDefaults::default(),
+            is_transcript_source: false,
         }
     }
 
@@ -759,6 +761,7 @@ mod tests {
                 label: "Default Mic".into(),
             },
             defaults: CompositionDefaults::default(),
+            is_transcript_source: false,
         };
         let snap = mgr
             .start_session(
@@ -793,6 +796,42 @@ mod tests {
     }
 
     #[test]
+    fn keep_session_snapshots_transcript_source_flag_into_sidecar() {
+        // Issue #40 — when the start_session caller marks a slot's
+        // CaptureRequest as the transcript source, the sidecar written
+        // on Keep echoes that designation. (Scene-driven flows set the
+        // flag in `scenes::build_capture_requests`; this test mirrors
+        // that contract at the manager layer.)
+        let (dir, vid) = course_with_video();
+        let (mgr, _) = manager();
+        let mic_request = CaptureRequest {
+            role: SourceRole::Microphone,
+            device: Device {
+                id: "default".into(),
+                label: "Default Mic".into(),
+            },
+            defaults: CompositionDefaults::default(),
+            is_transcript_source: true,
+        };
+        let snap = mgr
+            .start_session(
+                &course_folder(&dir),
+                &vid,
+                vec![screen_request(), mic_request],
+            )
+            .unwrap();
+        mgr.stop_session(&snap.id).unwrap();
+        let segs = mgr.keep_session(&snap.id).unwrap();
+
+        let screen_sidecar =
+            segments::read_sidecar(&course_folder(&dir), &vid, &segs[0].id).unwrap().unwrap();
+        let mic_sidecar =
+            segments::read_sidecar(&course_folder(&dir), &vid, &segs[1].id).unwrap().unwrap();
+        assert!(!screen_sidecar.is_transcript_source);
+        assert!(mic_sidecar.is_transcript_source);
+    }
+
+    #[test]
     fn mid_take_per_source_failure_writes_source_failed_sidecar_with_ended_at() {
         // Issue #37 mid-Take per-source failure rule: when one source fails
         // mid-Take, its sidecar carries `endedReason: sourceFailed` plus
@@ -807,6 +846,7 @@ mod tests {
                 label: "Default Mic".into(),
             },
             defaults: CompositionDefaults::default(),
+            is_transcript_source: false,
         };
         let snap = mgr
             .start_session(
@@ -944,6 +984,7 @@ mod tests {
                 label: "Default Mic".into(),
             },
             defaults: CompositionDefaults::default(),
+            is_transcript_source: false,
         };
         let marker = segments::TakeMarker {
             schema_version: segments::TakeMarker::SCHEMA_VERSION,
@@ -1028,6 +1069,7 @@ mod tests {
                 label: "Default Mic".into(),
             },
             defaults: CompositionDefaults::default(),
+            is_transcript_source: false,
         };
         let snap = mgr
             .start_session(

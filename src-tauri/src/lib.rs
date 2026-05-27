@@ -111,6 +111,7 @@ pub fn run() {
             commands::list_capture_devices,
             commands::set_scene_source_defaults,
             commands::reorder_scene_source,
+            commands::set_scene_transcript_source,
             commands::start_recording_with_scene,
             commands::pin_default_scene,
             commands::list_transcription_jobs,

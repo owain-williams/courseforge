@@ -44,11 +44,12 @@
 //! aborting the Tauri app.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::core::capture::{CaptureRequest, SourceRole};
+use crate::core::capture::SourceRole;
 use crate::core::error::{CoreError, Result};
-use super::{ActiveRecording, RecorderBackend, TakeRequest, TakeSource};
+use super::{ActiveRecording, RecorderBackend, SourceOutcome, TakeRequest, TakeSource};
 
 /// Phase 2 in-process recorder. Per-Take state lives on the
 /// `SckMacRecording` handle the backend returns from `start`.
@@ -71,8 +72,10 @@ impl RecorderBackend for SckMacBackend {
         // before this function returns. `imp::Take::start` handles the
         // cleanup internally on its own error path so we don't need to
         // unwind partial state here.
-        let take_state =
-            catch_panic("SckMacBackend::start", || imp::Take::start(&take))?;
+        let paused = Arc::new(AtomicBool::new(false));
+        let take_state = catch_panic("SckMacBackend::start", || {
+            imp::Take::start(&take, paused.clone())
+        })?;
         Ok(Box::new(SckMacRecording {
             partial_paths: take
                 .sources
@@ -80,6 +83,7 @@ impl RecorderBackend for SckMacBackend {
                 .map(|s| s.partial_path.clone())
                 .collect(),
             take: Mutex::new(Some(take_state)),
+            paused,
         }))
     }
 }
@@ -88,26 +92,30 @@ pub struct SckMacRecording {
     #[allow(dead_code)]
     partial_paths: Vec<PathBuf>,
     take: Mutex<Option<imp::Take>>,
+    /// Shared atomic the per-source sample-buffer delegates consult before
+    /// calling `appendSampleBuffer`. When `true`, samples are dropped — so
+    /// the visible-on-playback gap at the pause seam is identical across
+    /// every source in the Take (issue #37).
+    paused: Arc<AtomicBool>,
 }
 
 impl ActiveRecording for SckMacRecording {
     fn pause(&self) -> Result<()> {
-        // Phase 2 slice 4 stops short of sample-drop gating; issue #37
-        // wires the shared pause-gate atomic. The session state machine
-        // still flips so the UI is honest about user intent.
+        self.paused.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     fn resume(&self) -> Result<()> {
+        self.paused.store(false, Ordering::SeqCst);
         Ok(())
     }
 
-    fn stop(&self) -> Result<()> {
+    fn stop(&self) -> Result<Vec<SourceOutcome>> {
         let take = self.take.lock().unwrap().take();
         if let Some(take) = take {
-            catch_panic("SckMacBackend::stop", move || take.stop())?;
+            return catch_panic("SckMacBackend::stop", move || take.stop());
         }
-        Ok(())
+        Ok(Vec::new())
     }
 }
 
@@ -232,6 +240,7 @@ mod tests {
 mod imp {
     use std::path::Path;
     use std::sync::{mpsc, Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use block2::RcBlock;
@@ -254,9 +263,9 @@ mod imp {
         SCStreamOutput, SCStreamOutputType,
     };
 
-    use crate::core::capture::SourceRole;
+    use crate::core::capture::{EndedReason, SourceRole};
     use crate::core::error::{CoreError, Result};
-    use crate::recorder::{TakeRequest, TakeSource};
+    use crate::recorder::{SourceOutcome, TakeRequest, TakeSource};
 
     const SCK_CALLBACK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -271,9 +280,9 @@ mod imp {
     /// stream/session it pulls from, the delegate the OS calls into, and
     /// the shared per-source state that delegate consults for each sample.
     struct Source {
+        segment_id: String,
         kind: SourceKind,
         writer: Retained<AVAssetWriter>,
-        #[allow(dead_code)]
         shared: Arc<SourceShared>,
     }
 
@@ -300,11 +309,34 @@ mod imp {
     ///   at the moment that source's first sample landed.
     /// * `input` is the writer's video / primary input we route samples
     ///   into. For audio-only sources it's the audio input.
+    /// * `paused` is the Take-wide atomic the manager flips on Pause /
+    ///   Resume. Every source observes it on the same memory location, so
+    ///   the visible gap at the pause seam lands at the same PTS across
+    ///   every track in the Take (issue #37).
+    /// * `failed` records a mid-Take per-source failure so the manager
+    ///   emits `endedReason: sourceFailed` instead of `normal` for that
+    ///   source's sidecar.
     struct SourceShared {
         writer: Retained<AVAssetWriter>,
         input: Retained<AVAssetWriterInput>,
         started: Mutex<bool>,
+        paused: Arc<AtomicBool>,
+        failed: Mutex<Option<String>>,
     }
+
+    // Safety: AVAssetWriter / AVAssetWriterInput are documented as safe
+    // to call from any thread once startWriting has been issued (Apple's
+    // AVAssetWriter docs). All mutable access in this module is gated by
+    // the `started` and `failed` mutexes.
+    unsafe impl Send for SourceShared {}
+    unsafe impl Sync for SourceShared {}
+
+    /// Thread-safe wrapper around `Retained<AVAssetWriter>` so the per-
+    /// source finishWriting thread can own the handle. Apple documents
+    /// finishWriting / markAsFinished as safe to call from any thread.
+    pub struct SendableWriter(pub Retained<AVAssetWriter>);
+    unsafe impl Send for SendableWriter {}
+    unsafe impl Sync for SendableWriter {}
 
     // SCK / AVFoundation handles are documented as safe to use from
     // arbitrary threads. The outer Mutex in SckMacRecording serialises
@@ -315,7 +347,7 @@ mod imp {
     unsafe impl Sync for Take {}
 
     impl Take {
-        pub fn start(take: &TakeRequest) -> Result<Self> {
+        pub fn start(take: &TakeRequest, paused: Arc<AtomicBool>) -> Result<Self> {
             // Eagerly resolve shareable content once if any SCK source is
             // in the Take — saves N round-trips through the timeout-bound
             // async API.
@@ -333,7 +365,7 @@ mod imp {
             // tear down everything we've built so far — Atomic Start.
             let mut sources: Vec<Source> = Vec::with_capacity(take.sources.len());
             for src in &take.sources {
-                match Self::start_source(src, content.as_deref()) {
+                match Self::start_source(src, content.as_deref(), paused.clone()) {
                     Ok(s) => sources.push(s),
                     Err(e) => {
                         // Tear down anything we've already started.
@@ -357,6 +389,7 @@ mod imp {
         fn start_source(
             src: &TakeSource,
             content: Option<&SCShareableContent>,
+            paused: Arc<AtomicBool>,
         ) -> Result<Source> {
             let path_str = src.partial_path.to_str().ok_or_else(|| {
                 CoreError::Recorder(format!(
@@ -431,6 +464,8 @@ mod imp {
                 writer: writer.clone(),
                 input: input.clone(),
                 started: Mutex::new(false),
+                paused: paused.clone(),
+                failed: Mutex::new(None),
             });
 
             let kind = match src.request.role {
@@ -447,7 +482,12 @@ mod imp {
                 }
             };
 
-            Ok(Source { kind, writer, shared })
+            Ok(Source {
+                segment_id: src.segment_id.clone(),
+                kind,
+                writer,
+                shared,
+            })
         }
 
         fn start_sck_pipeline(
@@ -610,10 +650,9 @@ mod imp {
             })
         }
 
-        pub fn stop(self) -> Result<()> {
-            // Per-source stop: ask each pipeline to halt, then finalise
-            // every writer. Each writer's `finishWriting` blocks until
-            // the file is durably on disk. #37 parallelises this.
+        pub fn stop(self) -> Result<Vec<SourceOutcome>> {
+            // Ask each capture pipeline to halt first — once the stream /
+            // session stops, no more sample buffers are produced.
             for source in &self.sources {
                 match &source.kind {
                     SourceKind::Sck { stream, .. } => {
@@ -624,17 +663,98 @@ mod imp {
                     },
                 }
             }
-            for source in &self.sources {
-                let writer = source.writer.clone();
-                unsafe {
-                    for input in writer.inputs().iter() {
-                        input.markAsFinished();
+
+            // Finalise each writer in parallel — `finishWriting` is the
+            // slow step (the OS flushes the mdat/moov atoms to disk).
+            // Issuing them concurrently means Stop returns once the
+            // slowest single writer is durable rather than the sum of all
+            // of them (#37 AC).
+            //
+            // AVAssetWriter handles aren't `Send` per the autoderived
+            // bounds, so we ferry them across the thread boundary in a
+            // `SendableWriter` newtype (defined at module scope above).
+            let n = self.sources.len();
+            let mut handles = Vec::with_capacity(n);
+            for (idx, source) in self.sources.iter().enumerate() {
+                let writer = SendableWriter(source.writer.clone());
+                let shared = source.shared.clone();
+                handles.push(std::thread::spawn(move || -> (usize, Result<()>) {
+                    // Bind the whole SendableWriter into the closure so
+                    // Rust's precise-capture analysis sees the wrapper
+                    // (which is `unsafe impl Send`), not just `writer.0`
+                    // (which is `Retained<AVAssetWriter>` and isn't).
+                    let writer = writer;
+                    let r = unsafe {
+                        for input in writer.0.inputs().iter() {
+                            input.markAsFinished();
+                        }
+                        finish_writing_blocking(&writer.0)
+                    };
+                    if let Err(ref e) = r {
+                        let mut guard = shared.failed.lock().unwrap();
+                        if guard.is_none() {
+                            *guard = Some(format!("finishWriting: {e}"));
+                        }
                     }
-                    finish_writing_blocking(&writer)?;
-                }
+                    (idx, r)
+                }));
             }
-            Ok(())
+
+            // Collect outcomes in the original source order. Per-writer
+            // failures don't abort the others — they degrade to a
+            // per-source SourceFailed outcome so the rest of the Take
+            // survives (issue #37 mid-Take per-source failure rule).
+            let mut outcomes: Vec<Option<SourceOutcome>> = (0..n).map(|_| None).collect();
+            for h in handles {
+                let (idx, _r) = h.join().unwrap_or((usize::MAX, Ok(())));
+                if idx == usize::MAX {
+                    continue;
+                }
+                let source = &self.sources[idx];
+                let failed = source.shared.failed.lock().unwrap();
+                let outcome = if failed.is_some() {
+                    SourceOutcome {
+                        segment_id: source.segment_id.clone(),
+                        ended_reason: EndedReason::SourceFailed,
+                        ended_at: Some(iso8601_now()),
+                    }
+                } else {
+                    SourceOutcome {
+                        segment_id: source.segment_id.clone(),
+                        ended_reason: EndedReason::Normal,
+                        ended_at: None,
+                    }
+                };
+                outcomes[idx] = Some(outcome);
+            }
+            Ok(outcomes.into_iter().flatten().collect())
         }
+    }
+
+    fn iso8601_now() -> String {
+        // Same ISO-8601 shape the manager uses for `recorded_at`.
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let secs_per_day = 86_400u64;
+        let days = secs / secs_per_day;
+        let rem = secs % secs_per_day;
+        let h = rem / 3600;
+        let m = (rem % 3600) / 60;
+        let s = rem % 60;
+        let z = days as i64 + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = (z - era * 146_097) as u64;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe as i64 + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if mo <= 2 { y + 1 } else { y };
+        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, m, s)
     }
 
     impl Source {
@@ -771,23 +891,46 @@ mod imp {
 
     // --- delegates -----------------------------------------------------
 
-    /// Shared sample-handling routine. Drops the sample if the writer
-    /// isn't ready / the input isn't accepting; otherwise lazily starts
-    /// the writer's session at the sample's PTS and appends.
+    /// Shared sample-handling routine. Drops the sample if:
+    ///
+    /// * The Take is paused (atomic gate flipped by the manager).
+    /// * The source has already been marked failed mid-Take.
+    /// * The writer isn't in `Writing` status or the input isn't ready.
+    ///
+    /// Otherwise lazily starts the writer's session at the sample's PTS
+    /// and appends. If `appendSampleBuffer` returns false, treat that as
+    /// a per-source failure — record it on `shared.failed` so the Take's
+    /// final outcome carries `SourceFailed` while the rest of the Take
+    /// continues uninterrupted (issue #37 mid-Take rule).
     fn forward_sample(shared: &SourceShared, sample: &CMSampleBuffer) {
+        // Pause gate — drop samples while paused. Both pause and resume
+        // are SeqCst stores from the manager so every delegate sees the
+        // flip on the same PTS interval.
+        if shared.paused.load(Ordering::SeqCst) {
+            return;
+        }
+        // If we've already failed, stop appending so the file isn't
+        // contaminated by post-failure samples.
+        if shared.failed.lock().unwrap().is_some() {
+            return;
+        }
         unsafe {
-            // Drop samples until both writer and input are ready. This
-            // is the same pattern Apple's AVCam sample code uses.
             if shared.writer.status() != objc2_av_foundation::AVAssetWriterStatus::Writing {
+                // Writer entered an error / finished state mid-Take —
+                // record it as a per-source failure so we surface
+                // SourceFailed in the outcome.
+                let mut failed = shared.failed.lock().unwrap();
+                if failed.is_none() {
+                    *failed = Some(format!(
+                        "writer entered non-Writing status {:?}",
+                        shared.writer.status()
+                    ));
+                }
                 return;
             }
             if !shared.input.isReadyForMoreMediaData() {
                 return;
             }
-            // First sample: start the session at this PTS. Every later
-            // source's first sample lands within ~one tick of this one
-            // (they're all on the same system CMTime clock), preserving
-            // cross-source sync.
             {
                 let mut started = shared.started.lock().unwrap();
                 if !*started {
@@ -796,7 +939,13 @@ mod imp {
                     *started = true;
                 }
             }
-            let _ = shared.input.appendSampleBuffer(sample);
+            let ok = shared.input.appendSampleBuffer(sample);
+            if !ok {
+                let mut failed = shared.failed.lock().unwrap();
+                if failed.is_none() {
+                    *failed = Some("appendSampleBuffer returned false".into());
+                }
+            }
         }
     }
 

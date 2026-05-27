@@ -146,6 +146,13 @@ pub struct SegmentSidecar {
     pub recorded_at: String,
     pub defaults: CompositionDefaults,
     pub ended_reason: EndedReason,
+    /// ISO-8601 UTC timestamp the source's recording ended. Issue #37
+    /// records this on mid-Take per-source failure so the editor (and the
+    /// user) can tell when one source dropped while the rest of the Take
+    /// kept going. `None` is the v1-compatible "we didn't track it" state
+    /// — readers should fall back to the file's mtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
 }
 
 impl SegmentSidecar {
@@ -167,7 +174,16 @@ impl SegmentSidecar {
             recorded_at: recorded_at.into(),
             defaults,
             ended_reason,
+            ended_at: None,
         }
+    }
+
+    /// Tag the sidecar with an explicit end timestamp — used for mid-Take
+    /// per-source failures (issue #37) so the editor can show "this source
+    /// dropped at 12:34:56" vs the Take's full duration.
+    pub fn with_ended_at(mut self, ended_at: impl Into<String>) -> Self {
+        self.ended_at = Some(ended_at.into());
+        self
     }
 }
 

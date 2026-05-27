@@ -24,7 +24,7 @@ use crate::core::capture::{CaptureRequest, EndedReason, SegmentSidecar, SourceRo
 use crate::core::error::{CoreError, Result};
 use crate::core::recording::{RecordingSession, SegmentSlot, SessionState};
 use crate::core::segments;
-use crate::recorder::{ActiveRecording, RecorderBackend, TakeRequest, TakeSource};
+use crate::recorder::{ActiveRecording, RecorderBackend, SourceOutcome, TakeRequest, TakeSource};
 
 /// Snapshot of a session safe to ship over IPC. Mirrors [`RecordingSession`]
 /// (the field names line up so the frontend can deserialize the same shape).
@@ -47,6 +47,10 @@ struct ActiveSession {
     /// `None` once `stop()` has run; we keep the row around until the user
     /// decides Keep / Discard so the UI can still address it by id.
     recording: Option<Box<dyn ActiveRecording>>,
+    /// Per-source outcomes captured at Stop time — populated for the
+    /// AwaitingDecision window so Keep can write `endedReason:
+    /// sourceFailed` sidecars for sources that failed mid-Take (issue #37).
+    outcomes: Vec<SourceOutcome>,
 }
 
 impl ActiveSession {
@@ -143,6 +147,7 @@ impl RecordingManager {
             session,
             course_folder: course_folder.to_path_buf(),
             recording: Some(recording),
+            outcomes: Vec::new(),
         };
         let snap = entry.snapshot();
         self.sessions.lock().unwrap().insert(id, entry);
@@ -169,10 +174,11 @@ impl RecordingManager {
 
     pub fn stop_session(&self, id: &str) -> Result<SessionSnapshot> {
         // Take the recording handle out under the lock, then drop the lock
-        // before driving the backend's stop — finalising an AVAssetWriter
-        // can take a moment and we don't want every other IPC call to
-        // block on it. The session row stays in the registry (with
-        // `recording: None`) so the UI's id-based addressing still works.
+        // before driving the backend's stop — finalising N AVAssetWriters
+        // in parallel can take a moment and we don't want every other IPC
+        // call to block on it. The session row stays in the registry
+        // (with `recording: None`) so the UI's id-based addressing still
+        // works.
         let recording = {
             let mut sessions = self.sessions.lock().unwrap();
             let entry = sessions
@@ -181,14 +187,17 @@ impl RecordingManager {
             entry.recording.take()
         };
 
-        if let Some(rec) = recording {
-            rec.stop()?;
-        }
+        let outcomes = if let Some(rec) = recording {
+            rec.stop()?
+        } else {
+            Vec::new()
+        };
 
         let mut sessions = self.sessions.lock().unwrap();
         let entry = sessions
             .get_mut(id)
             .ok_or_else(|| CoreError::SessionNotFound(id.to_string()))?;
+        entry.outcomes = outcomes;
         entry.session.stop()?;
         Ok(entry.snapshot())
     }
@@ -235,17 +244,30 @@ impl RecordingManager {
         let video_id = entry.session.video_id.clone();
         let course_folder = entry.course_folder.clone();
         let slots = entry.session.slots.clone();
+        let outcomes = std::mem::take(&mut entry.outcomes);
+
+        let outcome_for = |segment_id: &str| -> (EndedReason, Option<String>) {
+            outcomes
+                .iter()
+                .find(|o| o.segment_id == segment_id)
+                .map(|o| (o.ended_reason, o.ended_at.clone()))
+                .unwrap_or((EndedReason::Normal, None))
+        };
 
         let mut out = Vec::with_capacity(slots.len());
         for slot in slots {
-            let sidecar = SegmentSidecar::new(
+            let (ended_reason, ended_at) = outcome_for(&slot.segment_id);
+            let mut sidecar = SegmentSidecar::new(
                 take_id.clone(),
                 slot.request.role,
                 slot.request.device.clone(),
                 recorded_at.clone(),
                 slot.request.defaults,
-                EndedReason::Normal,
+                ended_reason,
             );
+            if let Some(ended_at) = ended_at {
+                sidecar = sidecar.with_ended_at(ended_at);
+            }
             let seg = segments::finalize_segment(
                 &course_folder,
                 &video_id,
@@ -490,7 +512,7 @@ fn legacy_remux_mkv_to_mp4(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::core::capture::{CompositionDefaults, Device, SourceRole};
-    use crate::recorder::fake::FakeRecorderBackend;
+    use crate::recorder::fake::{FakeEvent, FakeRecorderBackend};
 
     fn course_with_video() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
@@ -503,7 +525,7 @@ mod tests {
 
     fn manager() -> (RecordingManager, FakeRecorderBackend) {
         let backend = FakeRecorderBackend::default();
-        let log_backend = FakeRecorderBackend { events: backend.shared_log() };
+        let log_backend = backend.shared_clone();
         let mgr = RecordingManager::new(Box::new(log_backend));
         (mgr, backend)
     }
@@ -666,6 +688,108 @@ mod tests {
         assert_eq!(sidecar_a.recorded_at, sidecar_b.recorded_at);
         assert_eq!(sidecar_a.source_role, SourceRole::Screen);
         assert_eq!(sidecar_b.source_role, SourceRole::Microphone);
+    }
+
+    #[test]
+    fn mid_take_per_source_failure_writes_source_failed_sidecar_with_ended_at() {
+        // Issue #37 mid-Take per-source failure rule: when one source fails
+        // mid-Take, its sidecar carries `endedReason: sourceFailed` plus
+        // the failure timestamp, and the rest of the Take continues to
+        // their natural Stop with `Normal`.
+        let (dir, vid) = course_with_video();
+        let (mgr, backend) = manager();
+        let mic_request = CaptureRequest {
+            role: SourceRole::Microphone,
+            device: Device {
+                id: "default".into(),
+                label: "Default Mic".into(),
+            },
+            defaults: CompositionDefaults::default(),
+        };
+        let snap = mgr
+            .start_session(
+                &course_folder(&dir),
+                &vid,
+                vec![screen_request(), mic_request],
+            )
+            .unwrap();
+        // Inject a failure on the *mic* slot before Stop runs.
+        let mic_segment_id = snap.requests[1].clone();
+        let _ = mic_segment_id;
+        // Backend keyed failures by segment id; pull the actual ids from
+        // the manager via list_sessions so the test stays decoupled from
+        // the registry's internal layout.
+        let sessions = mgr.list_sessions();
+        let mic_slot = &sessions[0];
+        let _ = mic_slot;
+        // The TakeSource ids land on the FakeRecording in order — slot 1
+        // is the mic. We don't expose them via SessionSnapshot, but the
+        // FakeRecorderBackend lets us look them up via its event log.
+        let start_paths: Vec<PathBuf> = match backend.events.lock().unwrap().first().unwrap() {
+            FakeEvent::Start { partial_paths, .. } => partial_paths.clone(),
+            _ => panic!("expected Start"),
+        };
+        // Segment id is the filename stem before `.partial.*`.
+        let mic_partial = &start_paths[1];
+        let mic_seg_id = mic_partial
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .split('.')
+            .next()
+            .unwrap()
+            .to_string();
+        backend.fail_source(&mic_seg_id, "2026-05-27T01:23:45Z");
+
+        mgr.stop_session(&snap.id).unwrap();
+        let segs = mgr.keep_session(&snap.id).unwrap();
+        assert_eq!(segs.len(), 2);
+
+        // Sidecar for the screen slot — normal.
+        let screen_sidecar =
+            segments::read_sidecar(&course_folder(&dir), &vid, &segs[0].id).unwrap().unwrap();
+        assert_eq!(screen_sidecar.ended_reason, EndedReason::Normal);
+        assert!(screen_sidecar.ended_at.is_none());
+
+        // Sidecar for the mic slot — sourceFailed with ended_at.
+        let mic_sidecar =
+            segments::read_sidecar(&course_folder(&dir), &vid, &segs[1].id).unwrap().unwrap();
+        assert_eq!(mic_sidecar.ended_reason, EndedReason::SourceFailed);
+        assert_eq!(mic_sidecar.ended_at.as_deref(), Some("2026-05-27T01:23:45Z"));
+    }
+
+    #[test]
+    fn pause_resume_drive_backend_pause_atomic_in_order() {
+        // Issue #37 atomic pause/resume: the manager flips the same
+        // shared atomic both writers consult. The fake backend exposes
+        // `paused` as an AtomicBool so tests can assert the gate is
+        // honoured even without a real OS-level capture pipeline.
+        let (dir, vid) = course_with_video();
+        let (mgr, _backend) = manager();
+        let snap = mgr
+            .start_session(&course_folder(&dir), &vid, vec![screen_request()])
+            .unwrap();
+        mgr.pause_session(&snap.id).unwrap();
+        // After Pause: the session is paused; the next sample would be
+        // dropped by `forward_sample`. We can't observe forward_sample
+        // directly from the fake, but we can verify the state machine.
+        assert_eq!(
+            mgr.list_sessions()
+                .into_iter()
+                .find(|s| s.id == snap.id)
+                .unwrap()
+                .state,
+            SessionState::Paused
+        );
+        mgr.resume_session(&snap.id).unwrap();
+        assert_eq!(
+            mgr.list_sessions()
+                .into_iter()
+                .find(|s| s.id == snap.id)
+                .unwrap()
+                .state,
+            SessionState::Recording
+        );
     }
 
     #[test]

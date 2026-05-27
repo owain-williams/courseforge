@@ -1,24 +1,23 @@
 //! In-memory recorder used by the session-manager tests and as the fallback
 //! backend on non-macOS dev machines.
 //!
-//! Behaviour: `start` touches the `.partial.mov` so downstream code sees a
-//! real file, and `pause` / `resume` / `stop` just update an `Arc<Mutex>`
-//! transition log. Tests can introspect that log to verify the manager
-//! called the backend in the right order with the right requests.
+//! Behaviour: `start` touches each source's `.partial.*` file so downstream
+//! code sees a real file per slot, and `pause` / `resume` / `stop` just
+//! update an `Arc<Mutex>` transition log. Tests can introspect that log to
+//! verify the manager called the backend in the right order with the right
+//! `TakeRequest`.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::core::capture::CaptureRequest;
 use crate::core::error::{CoreError, Result};
-use super::{ActiveRecording, RecorderBackend};
+use super::{ActiveRecording, RecorderBackend, TakeRequest};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FakeEvent {
     Start {
-        partial_path: PathBuf,
-        requests: Vec<CaptureRequest>,
         take_id: String,
+        partial_paths: Vec<PathBuf>,
     },
     Pause,
     Resume,
@@ -37,41 +36,37 @@ impl FakeRecorderBackend {
 }
 
 impl RecorderBackend for FakeRecorderBackend {
-    fn start(
-        &self,
-        partial_path: PathBuf,
-        requests: Vec<CaptureRequest>,
-        take_id: String,
-    ) -> Result<Box<dyn ActiveRecording>> {
-        // Touch the file so segments::finalize_segment sees something to rename.
-        if let Some(parent) = partial_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| CoreError::Io {
-                path: parent.to_path_buf(),
+    fn start(&self, take: TakeRequest) -> Result<Box<dyn ActiveRecording>> {
+        let mut paths = Vec::with_capacity(take.sources.len());
+        for src in &take.sources {
+            if let Some(parent) = src.partial_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| CoreError::Io {
+                    path: parent.to_path_buf(),
+                    source: e,
+                })?;
+            }
+            std::fs::write(&src.partial_path, b"FAKE-PARTIAL").map_err(|e| CoreError::Io {
+                path: src.partial_path.clone(),
                 source: e,
             })?;
+            paths.push(src.partial_path.clone());
         }
-        std::fs::write(&partial_path, b"FAKE-PARTIAL-MOV").map_err(|e| CoreError::Io {
-            path: partial_path.clone(),
-            source: e,
-        })?;
 
         self.events.lock().unwrap().push(FakeEvent::Start {
-            partial_path: partial_path.clone(),
-            requests,
-            take_id,
+            take_id: take.take_id,
+            partial_paths: paths.clone(),
         });
 
         Ok(Box::new(FakeRecording {
             events: self.events.clone(),
-            partial_path,
+            _partial_paths: paths,
         }))
     }
 }
 
 pub struct FakeRecording {
     events: Arc<Mutex<Vec<FakeEvent>>>,
-    #[allow(dead_code)] // held for parity with the real backend
-    partial_path: PathBuf,
+    _partial_paths: Vec<PathBuf>,
 }
 
 impl ActiveRecording for FakeRecording {
@@ -92,35 +87,62 @@ impl ActiveRecording for FakeRecording {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::capture::{CompositionDefaults, Device, SourceRole};
+    use crate::core::capture::{CaptureRequest, CompositionDefaults, Device, SourceRole};
+    use crate::recorder::TakeSource;
 
-    fn screen_request() -> CaptureRequest {
+    fn req(role: SourceRole) -> CaptureRequest {
         CaptureRequest {
-            role: SourceRole::Screen,
+            role,
             device: Device {
                 id: "default".into(),
-                label: "Main Display".into(),
+                label: "Default".into(),
             },
             defaults: CompositionDefaults::default(),
         }
     }
 
-    #[test]
-    fn start_writes_a_partial_file_and_records_requests_and_take_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("seg.partial.mov");
-        let backend = FakeRecorderBackend::default();
-        let _h = backend
-            .start(target.clone(), vec![screen_request()], "take-xyz".into())
-            .unwrap();
+    fn take_for(
+        dir: &std::path::Path,
+        sources: impl IntoIterator<Item = (CaptureRequest, &'static str)>,
+    ) -> TakeRequest {
+        let sources: Vec<TakeSource> = sources
+            .into_iter()
+            .enumerate()
+            .map(|(i, (request, ext))| TakeSource {
+                request,
+                segment_id: format!("seg-{i}"),
+                partial_path: dir.join(format!("seg-{i}.partial.{ext}")),
+            })
+            .collect();
+        TakeRequest {
+            take_id: "take-xyz".into(),
+            sources,
+        }
+    }
 
-        assert!(target.is_file());
+    #[test]
+    fn start_writes_a_partial_file_per_source_and_records_take_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = FakeRecorderBackend::default();
+        let take = take_for(
+            dir.path(),
+            [(req(SourceRole::Screen), "mov"), (req(SourceRole::Microphone), "m4a")],
+        );
+        let expected_paths = take
+            .sources
+            .iter()
+            .map(|s| s.partial_path.clone())
+            .collect::<Vec<_>>();
+        let _h = backend.start(take).unwrap();
+
+        for p in &expected_paths {
+            assert!(p.is_file(), "expected partial at {}", p.display());
+        }
         let events = backend.events.lock().unwrap();
         match events.first() {
-            Some(FakeEvent::Start { partial_path, requests, take_id }) => {
-                assert_eq!(partial_path, &target);
-                assert_eq!(requests, &vec![screen_request()]);
+            Some(FakeEvent::Start { take_id, partial_paths }) => {
                 assert_eq!(take_id, "take-xyz");
+                assert_eq!(partial_paths, &expected_paths);
             }
             other => panic!("expected Start event, got {other:?}"),
         }
@@ -129,11 +151,9 @@ mod tests {
     #[test]
     fn pause_resume_stop_are_logged_in_order() {
         let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("seg.partial.mov");
         let backend = FakeRecorderBackend::default();
-        let h = backend
-            .start(target, vec![screen_request()], "t".into())
-            .unwrap();
+        let take = take_for(dir.path(), [(req(SourceRole::Screen), "mov")]);
+        let h = backend.start(take).unwrap();
         h.pause().unwrap();
         h.resume().unwrap();
         h.stop().unwrap();

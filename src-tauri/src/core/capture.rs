@@ -20,6 +20,26 @@ pub enum SourceRole {
     SystemAudio,
 }
 
+impl SourceRole {
+    /// True iff the role produces audio samples only (no video track). Used
+    /// by the recorder to pick the right output container — audio-only
+    /// sources land in `.m4a`, video-and-audio sources in `.mov`.
+    pub fn is_audio_only(self) -> bool {
+        matches!(self, SourceRole::Microphone | SourceRole::SystemAudio)
+    }
+
+    /// True iff the role is sourced from ScreenCaptureKit (screen, window,
+    /// system audio). The Phase 2 backend routes these through one
+    /// `SCStream` per source. Camera and Microphone go through
+    /// `AVCaptureSession` instead.
+    pub fn is_sck_sourced(self) -> bool {
+        matches!(
+            self,
+            SourceRole::Screen | SourceRole::Window | SourceRole::SystemAudio
+        )
+    }
+}
+
 /// A specific device the user picked to back a [`SourceRole`]. The id is
 /// opaque to this layer — for screens it's a `CGDirectDisplayID` stringified;
 /// for AVCaptureSession devices it's the device's uniqueID; for "default"

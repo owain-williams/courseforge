@@ -418,7 +418,8 @@ mod tests {
             .start_session(&folder, &v.id, vec![screen_request()])
             .unwrap();
         rec.stop_session(&snap.id).unwrap();
-        let seg = rec.keep_session(&snap.id).unwrap();
+        let segs = rec.keep_session(&snap.id).unwrap();
+        let seg = segs.into_iter().next().expect("at least one Segment per Take");
         let seg_abs = folder.join(&seg.path);
 
         let backend = Arc::new(FakeTranscriberBackend::default());

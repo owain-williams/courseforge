@@ -316,8 +316,11 @@ export const resumeRecording = (sessionId: string) =>
 export const stopRecording = (sessionId: string) =>
   invoke<SessionSnapshot>('stop_recording', { sessionId });
 
+/// Issue #36 — Keep promotes every per-source partial in the Take to its
+/// final name and writes a per-Segment sidecar each. Returns one Segment
+/// record per slot so the UI can refresh its per-Video Segment list.
 export const keepSegment = (sessionId: string) =>
-  invoke<Segment>('keep_segment', { sessionId });
+  invoke<Segment[]>('keep_segment', { sessionId });
 
 export const discardSegment = (sessionId: string) =>
   invoke<void>('discard_segment', { sessionId });

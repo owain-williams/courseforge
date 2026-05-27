@@ -390,18 +390,18 @@ pub fn keep_segment(
     manager: tauri::State<'_, RecordingManager>,
     transcription: tauri::State<'_, TranscriptionManager>,
     session_id: String,
-) -> Result<Segment, AppError> {
+) -> Result<Vec<Segment>, AppError> {
     // Snapshot the session so we know which Course/Video to transcribe
     // *before* keep_session evicts it from the registry.
     let sessions = manager.list_sessions();
     let snap = sessions.into_iter().find(|s| s.id == session_id);
 
-    let seg = manager.keep_session(&session_id)?;
+    let segs = manager.keep_session(&session_id)?;
 
     if let Some(snap) = snap {
         transcription.enqueue(snap.course_folder, snap.video_id);
     }
-    Ok(seg)
+    Ok(segs)
 }
 
 #[tauri::command]

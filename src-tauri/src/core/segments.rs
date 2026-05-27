@@ -20,13 +20,19 @@
 
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
-use crate::core::capture::SegmentSidecar;
+use crate::core::capture::{CaptureRequest, SegmentSidecar, SourceRole};
 use crate::core::error::{CoreError, Result};
 
-/// New (Phase 1) extension for finalised Segments.
+/// New (Phase 1) extension for video-source finalised Segments.
 pub const SEGMENT_EXT: &str = "mov";
-/// New (Phase 1) partial suffix for in-progress captures.
+/// New (Phase 1) partial suffix for in-progress video-source captures.
 pub const PARTIAL_SUFFIX: &str = "partial.mov";
+/// Phase 2 audio-only finalised-Segment extension (microphone, system
+/// audio). AAC-in-MP4 container — same shape AVAssetWriter writes when
+/// given only an audio input.
+pub const SEGMENT_EXT_AUDIO: &str = "m4a";
+/// Phase 2 audio-only partial suffix.
+pub const PARTIAL_SUFFIX_AUDIO: &str = "partial.m4a";
 /// Sidecar JSON extension, sibling to the Segment file.
 pub const SIDECAR_EXT: &str = "json";
 
@@ -38,6 +44,25 @@ pub const LEGACY_SEGMENT_EXT: &str = "mp4";
 /// path runs ffmpeg under the hood for these — the only place ffmpeg
 /// touches the recorder side post-Phase-1).
 pub const LEGACY_PARTIAL_SUFFIX: &str = "partial.mkv";
+
+/// Closed-taxonomy mapping from Source Role to the partial/final file
+/// extensions the recorder backend writes. Audio-only sources land in
+/// `.m4a` (AAC); video-and-audio sources land in `.mov` (QuickTime).
+pub fn partial_suffix_for(role: SourceRole) -> &'static str {
+    if role.is_audio_only() {
+        PARTIAL_SUFFIX_AUDIO
+    } else {
+        PARTIAL_SUFFIX
+    }
+}
+
+pub fn segment_ext_for(role: SourceRole) -> &'static str {
+    if role.is_audio_only() {
+        SEGMENT_EXT_AUDIO
+    } else {
+        SEGMENT_EXT
+    }
+}
 
 /// A finalised Segment on disk. Discovered by scanning, not stored in course.json.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -78,6 +103,10 @@ fn sidecar_path_for(folder: &Path, video_id: &str, segment_id: &str) -> PathBuf 
 /// Returns the absolute path so the recorder doesn't have to know about the
 /// Course Folder layout — callers serialise it back to a relative path
 /// before persisting (see `to_relative`).
+///
+/// Backwards-compatible helper for the single-source Phase 1 call sites
+/// that still exist. Phase 2 multi-source flows use
+/// [`prepare_take_paths`].
 pub fn prepare_segment_path(folder: &Path, video_id: &str) -> Result<(String, PathBuf)> {
     let dir = segments_dir(folder, video_id);
     std::fs::create_dir_all(&dir).map_err(|e| CoreError::Io {
@@ -87,6 +116,37 @@ pub fn prepare_segment_path(folder: &Path, video_id: &str) -> Result<(String, Pa
     let id = new_id();
     let path = dir.join(format!("{id}.{PARTIAL_SUFFIX}"));
     Ok((id, path))
+}
+
+/// Per-source allocation in a Take — one of these per `CaptureRequest`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakeSlot {
+    pub segment_id: String,
+    pub partial_path: PathBuf,
+}
+
+/// Allocate N segment ids and partial paths for one Take, picking the
+/// right partial extension per Source Role (`.partial.mov` for video,
+/// `.partial.m4a` for audio-only). The segments folder is created once
+/// up front rather than per slot.
+pub fn prepare_take_paths(
+    folder: &Path,
+    video_id: &str,
+    requests: &[CaptureRequest],
+) -> Result<Vec<TakeSlot>> {
+    let dir = segments_dir(folder, video_id);
+    std::fs::create_dir_all(&dir).map_err(|e| CoreError::Io {
+        path: dir.clone(),
+        source: e,
+    })?;
+    let mut out = Vec::with_capacity(requests.len());
+    for req in requests {
+        let id = new_id();
+        let suffix = partial_suffix_for(req.role);
+        let path = dir.join(format!("{id}.{suffix}"));
+        out.push(TakeSlot { segment_id: id, partial_path: path });
+    }
+    Ok(out)
 }
 
 /// Promote an in-progress `.partial.mov` to its final name and write the
@@ -104,8 +164,10 @@ pub fn finalize_segment(
     sidecar: SegmentSidecar,
 ) -> Result<Segment> {
     let dir = segments_dir(folder, video_id);
-    let partial = dir.join(format!("{segment_id}.{PARTIAL_SUFFIX}"));
-    let final_path = dir.join(format!("{segment_id}.{SEGMENT_EXT}"));
+    let partial_suffix = partial_suffix_for(sidecar.source_role);
+    let final_ext = segment_ext_for(sidecar.source_role);
+    let partial = dir.join(format!("{segment_id}.{partial_suffix}"));
+    let final_path = dir.join(format!("{segment_id}.{final_ext}"));
 
     if partial.is_file() {
         // Rename is atomic on the same filesystem (segments live under one
@@ -150,12 +212,14 @@ pub fn adopt_orphan(
     legacy_remux_fn: impl FnOnce(&Path, &Path) -> Result<()>,
 ) -> Result<Segment> {
     let dir = segments_dir(folder, video_id);
-    let new_partial = dir.join(format!("{segment_id}.{PARTIAL_SUFFIX}"));
+    let video_partial = dir.join(format!("{segment_id}.{PARTIAL_SUFFIX}"));
+    let audio_partial = dir.join(format!("{segment_id}.{PARTIAL_SUFFIX_AUDIO}"));
     let legacy_partial = dir.join(format!("{segment_id}.{LEGACY_PARTIAL_SUFFIX}"));
 
-    if new_partial.is_file() {
+    if video_partial.is_file() || audio_partial.is_file() {
         // Phase 1+ path — same as a normal finalize but with crashed reason
-        // already baked into the caller-supplied sidecar.
+        // already baked into the caller-supplied sidecar. finalize_segment
+        // picks the right partial suffix based on the sidecar's source role.
         return finalize_segment(folder, video_id, segment_id, new_shape_sidecar);
     }
 
@@ -172,22 +236,16 @@ pub fn adopt_orphan(
         });
     }
 
-    // Already-finalised by a previous adopt attempt? Either extension counts.
-    let new_final = dir.join(format!("{segment_id}.{SEGMENT_EXT}"));
-    let legacy_final = dir.join(format!("{segment_id}.{LEGACY_SEGMENT_EXT}"));
-    if new_final.is_file() {
-        return Ok(Segment {
-            id: segment_id.to_string(),
-            video_id: video_id.to_string(),
-            path: to_relative(folder, &new_final),
-        });
-    }
-    if legacy_final.is_file() {
-        return Ok(Segment {
-            id: segment_id.to_string(),
-            video_id: video_id.to_string(),
-            path: to_relative(folder, &legacy_final),
-        });
+    // Already-finalised by a previous adopt attempt? Any extension counts.
+    for ext in [SEGMENT_EXT, SEGMENT_EXT_AUDIO, LEGACY_SEGMENT_EXT] {
+        let candidate = dir.join(format!("{segment_id}.{ext}"));
+        if candidate.is_file() {
+            return Ok(Segment {
+                id: segment_id.to_string(),
+                video_id: video_id.to_string(),
+                path: to_relative(folder, &candidate),
+            });
+        }
     }
 
     Err(CoreError::SegmentNotFound(segment_id.to_string()))
@@ -199,7 +257,7 @@ pub fn adopt_orphan(
 /// the user already cleaned up by hand.
 pub fn discard_partial(folder: &Path, video_id: &str, segment_id: &str) -> Result<()> {
     let dir = segments_dir(folder, video_id);
-    for suffix in [PARTIAL_SUFFIX, LEGACY_PARTIAL_SUFFIX] {
+    for suffix in [PARTIAL_SUFFIX, PARTIAL_SUFFIX_AUDIO, LEGACY_PARTIAL_SUFFIX] {
         let partial = dir.join(format!("{segment_id}.{suffix}"));
         if partial.is_file() {
             std::fs::remove_file(&partial).map_err(|e| CoreError::Io {
@@ -294,8 +352,9 @@ pub fn list_segments(folder: &Path, video_id: &str) -> Result<Vec<Segment>> {
         if name.starts_with('.') {
             continue;
         }
-        // Skip the two partial-suffix shapes and the sidecar JSON files.
+        // Skip every partial-suffix shape and the sidecar JSON files.
         if name.ends_with(&format!(".{PARTIAL_SUFFIX}"))
+            || name.ends_with(&format!(".{PARTIAL_SUFFIX_AUDIO}"))
             || name.ends_with(&format!(".{LEGACY_PARTIAL_SUFFIX}"))
             || name.ends_with(&format!(".{SIDECAR_EXT}"))
         {
@@ -376,11 +435,13 @@ pub fn scan_orphans(folder: &Path) -> Result<Vec<OrphanSegment>> {
 
 fn strip_segment_ext(name: &str) -> Option<&str> {
     name.strip_suffix(&format!(".{SEGMENT_EXT}"))
+        .or_else(|| name.strip_suffix(&format!(".{SEGMENT_EXT_AUDIO}")))
         .or_else(|| name.strip_suffix(&format!(".{LEGACY_SEGMENT_EXT}")))
 }
 
 fn strip_partial_suffix(name: &str) -> Option<&str> {
     name.strip_suffix(&format!(".{PARTIAL_SUFFIX}"))
+        .or_else(|| name.strip_suffix(&format!(".{PARTIAL_SUFFIX_AUDIO}")))
         .or_else(|| name.strip_suffix(&format!(".{LEGACY_PARTIAL_SUFFIX}")))
 }
 

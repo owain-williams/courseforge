@@ -19,22 +19,39 @@ pub mod fake;
 #[cfg(target_os = "macos")]
 pub mod sck_mac;
 
+/// One per-source slot in a Take — pairs the `CaptureRequest` (role +
+/// device + composition defaults) with the segment id and partial path
+/// the manager has allocated for this source. The backend writes its
+/// per-source AVAssetWriter output to `partial_path` and the manager
+/// later renames it to its final form during `finalize_segment`.
+#[derive(Debug, Clone)]
+pub struct TakeSource {
+    pub request: CaptureRequest,
+    pub segment_id: String,
+    pub partial_path: PathBuf,
+}
+
+/// One Take's worth of sources, plus the take-grouping id shared across
+/// every Segment in the Take. Per ADR-0002 every per-Segment sidecar in
+/// the Take echoes `take_id` back so the editor can group them.
+#[derive(Debug, Clone)]
+pub struct TakeRequest {
+    pub take_id: String,
+    pub sources: Vec<TakeSource>,
+}
+
 /// Factory for per-session recording handles. Lives in Tauri-managed state
 /// as a `Box<dyn RecorderBackend>` so commands can mint a fresh
 /// `ActiveRecording` per `start_recording` call without caring which backend
 /// is wired up.
 pub trait RecorderBackend: Send + Sync {
-    /// Start a recording. `partial_path` is the `.partial.mov` the backend
-    /// should stream to (the manager allocates one path per Take); the
-    /// final rename lands at `finalize_segment` time. `requests` describes
-    /// the sources to capture; `take_id` is the per-Take grouping id the
-    /// backend echoes back into per-Segment sidecars.
-    fn start(
-        &self,
-        partial_path: PathBuf,
-        requests: Vec<CaptureRequest>,
-        take_id: String,
-    ) -> Result<Box<dyn ActiveRecording>>;
+    /// Start a Take (one or more sources captured together). Phase 2's
+    /// macOS backend fans out to N AVAssetWriters under one shared
+    /// `CMSampleBuffer` PTS clock; non-macOS falls back to the in-memory
+    /// fake. Atomic Start: any single-source initialisation failure
+    /// tears the whole Take down before returning and leaves no partial
+    /// files behind.
+    fn start(&self, take: TakeRequest) -> Result<Box<dyn ActiveRecording>>;
 }
 
 /// One in-progress capture. The handle is interior-mutable so callers can

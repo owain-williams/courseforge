@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::capture::{CompositionDefaults, Device, SourceRole};
+use crate::core::capture::{CaptureRequest, CompositionDefaults, Device, SourceRole};
 use crate::core::error::{CoreError, Result};
 
 pub const SCENES_JSON: &str = "scenes.json";
@@ -261,6 +261,54 @@ fn find_scene_mut<'a>(file: &'a mut ScenesFile, scene_id: &str) -> Result<&'a mu
         .iter_mut()
         .find(|s| s.id == scene_id)
         .ok_or_else(|| CoreError::SceneNotFound(scene_id.to_string()))
+}
+
+/// Build the `Vec<CaptureRequest>` that drives one Take from a Scene's
+/// source rows. The `live_devices_by_role` map is the result of calling
+/// `core::devices::list_capture_devices` for each role present in the
+/// Scene; passing the live list in (rather than calling it inside) keeps
+/// this function pure for testing and lets the caller share one device
+/// enumeration round-trip across all roles.
+///
+/// Pre-Start validation per the issue: any source whose bound device id
+/// is not the `"default"` sentinel *and* not present in the live device
+/// list for that role fails Start with a per-source diagnostic naming the
+/// missing device. The `"default"` sentinel is always allowed because it
+/// resolves to whatever the OS picks at Capture time.
+///
+/// Empty Scenes are rejected too — there's nothing to record.
+pub fn build_capture_requests(
+    scene: &Scene,
+    live_devices_by_role: &std::collections::HashMap<SourceRole, Vec<Device>>,
+) -> Result<Vec<CaptureRequest>> {
+    if scene.sources.is_empty() {
+        return Err(CoreError::SceneHasNoSources {
+            scene_name: scene.name.clone(),
+        });
+    }
+    let mut out = Vec::with_capacity(scene.sources.len());
+    for src in &scene.sources {
+        if src.device.id != "default" {
+            let live = live_devices_by_role
+                .get(&src.role)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if !live.iter().any(|d| d.id == src.device.id) {
+                return Err(CoreError::SceneDeviceMissing {
+                    scene_name: scene.name.clone(),
+                    role: format!("{:?}", src.role),
+                    device_label: src.device.label.clone(),
+                    device_id: src.device.id.clone(),
+                });
+            }
+        }
+        out.push(CaptureRequest {
+            role: src.role,
+            device: src.device.clone(),
+            defaults: src.defaults,
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -521,6 +569,91 @@ mod tests {
             err,
             CoreError::SceneSourceIndexOutOfBounds { .. }
         ));
+    }
+
+    fn live_map(
+        entries: impl IntoIterator<Item = (SourceRole, Vec<Device>)>,
+    ) -> std::collections::HashMap<SourceRole, Vec<Device>> {
+        entries.into_iter().collect()
+    }
+
+    #[test]
+    fn build_capture_requests_passes_through_default_sentinel_without_device_check() {
+        let scene = Scene {
+            id: "s".into(),
+            name: "Mic Only".into(),
+            sources: vec![SceneSource::placeholder(SourceRole::Microphone)],
+        };
+        // No live mics at all — but the row is bound to "default" so it
+        // resolves at Capture time. Build must succeed.
+        let live = live_map([]);
+        let reqs = build_capture_requests(&scene, &live).unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].role, SourceRole::Microphone);
+        assert_eq!(reqs[0].device.id, "default");
+    }
+
+    #[test]
+    fn build_capture_requests_passes_when_real_device_is_present_in_live_list() {
+        let scene = Scene {
+            id: "s".into(),
+            name: "FaceTime".into(),
+            sources: vec![SceneSource {
+                role: SourceRole::Camera,
+                device: Device { id: "0xCAM01".into(), label: "FaceTime HD".into() },
+                defaults: CompositionDefaults::default(),
+            }],
+        };
+        let live = live_map([(
+            SourceRole::Camera,
+            vec![Device { id: "0xCAM01".into(), label: "FaceTime HD".into() }],
+        )]);
+        let reqs = build_capture_requests(&scene, &live).unwrap();
+        assert_eq!(reqs[0].device.id, "0xCAM01");
+    }
+
+    #[test]
+    fn build_capture_requests_fails_when_named_device_is_unplugged() {
+        let scene = Scene {
+            id: "s".into(),
+            name: "USB Cam".into(),
+            sources: vec![SceneSource {
+                role: SourceRole::Camera,
+                device: Device { id: "0xUSB99".into(), label: "Logi Webcam".into() },
+                defaults: CompositionDefaults::default(),
+            }],
+        };
+        let live = live_map([(
+            SourceRole::Camera,
+            vec![Device { id: "0xCAM01".into(), label: "FaceTime HD".into() }],
+        )]);
+        let err = build_capture_requests(&scene, &live).unwrap_err();
+        match err {
+            CoreError::SceneDeviceMissing {
+                scene_name,
+                role,
+                device_label,
+                device_id,
+            } => {
+                assert_eq!(scene_name, "USB Cam");
+                assert_eq!(role, "Camera");
+                assert_eq!(device_label, "Logi Webcam");
+                assert_eq!(device_id, "0xUSB99");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_capture_requests_fails_on_empty_scene() {
+        let scene = Scene {
+            id: "s".into(),
+            name: "Empty".into(),
+            sources: vec![],
+        };
+        let live = live_map([]);
+        let err = build_capture_requests(&scene, &live).unwrap_err();
+        assert!(matches!(err, CoreError::SceneHasNoSources { .. }));
     }
 
     #[test]

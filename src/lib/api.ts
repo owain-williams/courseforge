@@ -66,7 +66,15 @@ export const renameCourse = (folder: string, newTitle: string) =>
   invoke<string>('rename_course', { folder, newTitle });
 
 export type Module = { id: string; title: string; videoIds: string[] };
-export type Video = { id: string; title: string; stateId: string | null };
+export type Video = {
+  id: string;
+  title: string;
+  stateId: string | null;
+  /// Optional pinned default Scene (issue #35). Absent when the Video has
+  /// no pin — Record then opens the Scene picker (or falls back to the
+  /// legacy Screen+Mic synthetic request list when no Scenes exist at all).
+  defaultSceneId?: string;
+};
 export type WorkflowState = { id: string; name: string };
 export type Course = {
   schemaVersion: number;
@@ -268,6 +276,35 @@ export const startRecording = (
     folder,
     videoId,
     requests
+  });
+
+/// Issue #35 — Scene-driven recording. The backend reads the Scene,
+/// validates each non-"default" device against the live device list, and
+/// builds the `Vec<CaptureRequest>` itself. A missing device fails
+/// pre-Start with a per-source diagnostic.
+export const startRecordingWithScene = (
+  folder: string,
+  videoId: string,
+  sceneId: string
+) =>
+  invoke<SessionSnapshot>('start_recording_with_scene', {
+    folder,
+    videoId,
+    sceneId
+  });
+
+/// Pin (or unpin with `null`) the default Scene used by Record for one
+/// Video. Persists in course.json so the choice survives a Course Folder
+/// copy.
+export const pinDefaultScene = (
+  folder: string,
+  videoId: string,
+  sceneId: string | null
+) =>
+  invoke<void>('pin_default_scene', {
+    folder,
+    videoId,
+    sceneId
   });
 
 export const pauseRecording = (sessionId: string) =>

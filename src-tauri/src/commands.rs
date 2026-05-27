@@ -324,6 +324,43 @@ pub fn start_recording(
     Ok(manager.start_session(&folder, &video_id, requests)?)
 }
 
+/// Start a recording driven by a Scene (issue #35). Builds the
+/// `Vec<CaptureRequest>` from the Scene's source rows, validates every
+/// non-"default" device against the live device list, and forwards to
+/// `start_recording`. Any pre-Start validation failure surfaces with a
+/// per-source diagnostic naming the missing device — the caller never
+/// touches the recorder.
+#[tauri::command]
+pub fn start_recording_with_scene(
+    manager: tauri::State<'_, RecordingManager>,
+    folder: PathBuf,
+    video_id: String,
+    scene_id: String,
+) -> Result<SessionSnapshot, AppError> {
+    let all = scenes::list_scenes(&folder)?;
+    let scene = all
+        .into_iter()
+        .find(|s| s.id == scene_id)
+        .ok_or_else(|| AppError {
+            message: format!("scene not found: {scene_id}"),
+        })?;
+    let mut live = std::collections::HashMap::new();
+    for role in scene.sources.iter().map(|s| s.role).collect::<std::collections::HashSet<_>>() {
+        live.insert(role, devices::list_capture_devices(role)?);
+    }
+    let requests = scenes::build_capture_requests(&scene, &live)?;
+    Ok(manager.start_session(&folder, &video_id, requests)?)
+}
+
+#[tauri::command]
+pub fn pin_default_scene(
+    folder: PathBuf,
+    video_id: String,
+    scene_id: Option<String>,
+) -> Result<(), AppError> {
+    Ok(course::pin_default_scene(&folder, &video_id, scene_id)?)
+}
+
 #[tauri::command]
 pub fn pause_recording(
     manager: tauri::State<'_, RecordingManager>,

@@ -23,6 +23,8 @@
     recordingPreflight,
     openSettingsPane,
     startRecording,
+    startRecordingWithScene,
+    pinDefaultScene,
     pauseRecording,
     resumeRecording,
     stopRecording,
@@ -726,6 +728,27 @@
     }
   }
 
+  // Scene picker state (issue #35). When `scenePickerOpenForVideo` is set,
+  // the modal is open targeting that Video. `pinAsDefault` records whether
+  // the user wants the picked Scene saved as the Video's pinned default.
+  let scenePickerOpenForVideo = $state<string | null>(null);
+  let scenePickerPinAsDefault = $state(true);
+
+  function pinnedSceneFor(videoId: string): Scene | undefined {
+    const v = videoById(videoId);
+    if (!v?.defaultSceneId) return undefined;
+    return scenes.find((s) => s.id === v.defaultSceneId);
+  }
+
+  async function ensureScenesLoaded() {
+    if (!scenesLoaded) await loadScenes();
+  }
+
+  /// "Record" button entry point. Decision tree:
+  ///   1. Video has a pinned Scene that still exists → record with it.
+  ///   2. At least one Scene exists → open the Scene picker.
+  ///   3. No Scenes at all → fall back to the legacy boolean-trio synthetic
+  ///      Screen+Mic request list so v1 Course Folders still record.
   async function startRecordingForVideo(videoId: string) {
     if (!folder) return;
     await refreshPermissions();
@@ -734,12 +757,74 @@
       return;
     }
     permsBlockingVideoId = null;
+    await ensureScenesLoaded();
+
+    const pinned = pinnedSceneFor(videoId);
+    if (pinned) {
+      await startWithScene(videoId, pinned.id, false);
+      return;
+    }
+    if (scenes.length > 0) {
+      scenePickerOpenForVideo = videoId;
+      scenePickerPinAsDefault = true;
+      return;
+    }
+    // Legacy fallback — no Scenes in the Course at all.
     await withBusy(async () => {
       const requests = captureRequestsFromSources(recordingSources);
       const snap = await startRecording(folder!, videoId, requests);
       sessionsByVideo = { ...sessionsByVideo, [videoId]: snap };
       sessionStartedAt = { ...sessionStartedAt, [snap.id]: Date.now() };
     });
+  }
+
+  /// "Record with…" — always opens the picker, even when a Scene is pinned.
+  async function recordWithSceneFor(videoId: string) {
+    if (!folder) return;
+    await refreshPermissions();
+    if (!permissionsSatisfied(permissions, recordingSources)) {
+      permsBlockingVideoId = videoId;
+      return;
+    }
+    permsBlockingVideoId = null;
+    await ensureScenesLoaded();
+    if (scenes.length === 0) {
+      error = 'No Scenes yet — create one in the Scenes view first.';
+      return;
+    }
+    scenePickerOpenForVideo = videoId;
+    scenePickerPinAsDefault = false;
+  }
+
+  async function startWithScene(
+    videoId: string,
+    sceneId: string,
+    pinAsDefault: boolean
+  ) {
+    if (!folder) return;
+    await withBusy(async () => {
+      if (pinAsDefault) {
+        try {
+          await pinDefaultScene(folder!, videoId, sceneId);
+          if (course) {
+            course = {
+              ...course,
+              videos: course.videos.map((v) =>
+                v.id === videoId ? { ...v, defaultSceneId: sceneId } : v
+              )
+            };
+          }
+        } catch (e) {
+          // Non-fatal — pinning is a convenience, not the goal of the
+          // click. Carry on and start the recording anyway.
+          console.warn('pinDefaultScene', e);
+        }
+      }
+      const snap = await startRecordingWithScene(folder!, videoId, sceneId);
+      sessionsByVideo = { ...sessionsByVideo, [videoId]: snap };
+      sessionStartedAt = { ...sessionStartedAt, [snap.id]: Date.now() };
+    });
+    scenePickerOpenForVideo = null;
   }
 
   async function pauseFor(videoId: string) {
@@ -1604,10 +1689,20 @@
                           disabled={busy || segs.length > 0}
                           title={segs.length > 0
                             ? 'This Video already has a Segment — multi-Segment Videos arrive in a later slice.'
-                            : 'Start recording for this Video'}
+                            : v.defaultSceneId
+                              ? 'Record using this Video’s pinned Scene'
+                              : 'Start recording for this Video'}
                           onclick={() => startRecordingForVideo(v.id)}
                         >
                           ● Record
+                        </button>
+                        <button
+                          class="link"
+                          disabled={busy || segs.length > 0}
+                          title="Pick a Scene for this take only"
+                          onclick={() => recordWithSceneFor(v.id)}
+                        >
+                          Record with…
                         </button>
                       {/if}
                       {#if segs.length > 0}
@@ -2046,6 +2141,53 @@
           {/each}
         </ol>
       </section>
+    {/if}
+
+    {#if scenePickerOpenForVideo}
+      {@const targetId = scenePickerOpenForVideo}
+      <div class="scene-picker-backdrop" role="dialog" aria-modal="true">
+        <div class="scene-picker">
+          <header>
+            <h2>Choose a Scene</h2>
+            <button
+              class="ghost"
+              onclick={() => (scenePickerOpenForVideo = null)}
+              disabled={busy}
+            >Cancel</button>
+          </header>
+          <p class="hint">
+            Pick the Scene to record with. The Take will use that Scene's
+            source list and bound devices.
+          </p>
+          <ul class="picker-list">
+            {#each scenes as s (s.id)}
+              <li>
+                <button
+                  class="picker-row"
+                  disabled={busy}
+                  onclick={() => startWithScene(targetId, s.id, scenePickerPinAsDefault)}
+                >
+                  <span class="picker-name">{s.name}</span>
+                  <span class="picker-chips">
+                    {#each s.sources as src, i (i)}
+                      <span class="chip">
+                        <span class="chip-role">{sourceRoleLabel(src.role)}</span>
+                      </span>
+                    {/each}
+                    {#if s.sources.length === 0}
+                      <span class="chip-empty">(empty Scene)</span>
+                    {/if}
+                  </span>
+                </button>
+              </li>
+            {/each}
+          </ul>
+          <label class="picker-pin">
+            <input type="checkbox" bind:checked={scenePickerPinAsDefault} />
+            Pin as this Video's default Scene
+          </label>
+        </div>
+      </div>
     {/if}
   {/if}
 </main>
@@ -2828,5 +2970,83 @@
   }
   .add-source {
     font-size: 0.85rem;
+  }
+
+  /* Scene picker modal (issue #35). */
+  .scene-picker-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.32);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+  }
+  .scene-picker {
+    background: #fff;
+    border-radius: 8px;
+    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.2);
+    padding: 1.25rem;
+    width: min(36rem, calc(100% - 2rem));
+    max-height: 80vh;
+    overflow: auto;
+  }
+  .scene-picker header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.25rem;
+  }
+  .scene-picker header h2 {
+    margin: 0;
+    font-size: 1.1rem;
+  }
+  .scene-picker .hint {
+    color: #666;
+    margin: 0 0 0.75rem;
+    font-size: 0.9rem;
+  }
+  .picker-list {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+  .picker-row {
+    width: 100%;
+    text-align: left;
+    background: #fafafa;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 0.6rem 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    cursor: pointer;
+  }
+  .picker-row:hover {
+    background: #f0f5ff;
+    border-color: #99baff;
+  }
+  .picker-name {
+    font-weight: 600;
+  }
+  .picker-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+  }
+  .chip-empty {
+    color: #999;
+    font-style: italic;
+  }
+  .picker-pin {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.9rem;
+    color: #444;
   }
 </style>

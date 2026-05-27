@@ -48,6 +48,19 @@ pub enum CoreError {
         len: usize,
     },
 
+    #[error("scene \"{scene_name}\" has no sources to record")]
+    SceneHasNoSources { scene_name: String },
+
+    #[error(
+        "scene \"{scene_name}\" expects {role} device \"{device_label}\" ({device_id}) but it's not currently attached"
+    )]
+    SceneDeviceMissing {
+        scene_name: String,
+        role: String,
+        device_label: String,
+        device_id: String,
+    },
+
     #[error("invalid cut: end ({end}) must be greater than start ({start})")]
     InvalidCut { start: f64, end: f64 },
 

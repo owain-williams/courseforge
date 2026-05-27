@@ -20,6 +20,12 @@ pub struct Video {
     pub title: String,
     #[serde(rename = "stateId", default)]
     pub state_id: Option<String>,
+    /// Optional pinned Scene id (issue #35). When set, hitting Record on
+    /// this Video uses the named Scene's source list to build the
+    /// `Vec<CaptureRequest>`; when missing, the Record button opens the
+    /// Scene picker first. `None` keeps v1 Course Folders unchanged.
+    #[serde(rename = "defaultSceneId", default, skip_serializing_if = "Option::is_none")]
+    pub default_scene_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -331,6 +337,30 @@ pub fn remove_workflow_state(
     Ok(())
 }
 
+/// Pin or unpin a Video's default Scene (issue #35). `scene_id = None`
+/// clears the pin. Passing an empty string also clears the pin so the
+/// frontend can use a single command for both. The Scene id is not
+/// validated against `scenes.json` here — Record-time validation surfaces
+/// a precise per-source diagnostic if the Scene was deleted between pin
+/// and Record.
+pub fn pin_default_scene(
+    folder: &Path,
+    video_id: &str,
+    scene_id: Option<String>,
+) -> Result<()> {
+    let scene_id = scene_id.filter(|s| !s.is_empty());
+    mutate_course(folder, |c| {
+        let v = c
+            .videos
+            .iter_mut()
+            .find(|v| v.id == video_id)
+            .ok_or_else(|| CoreError::VideoNotFound(video_id.to_string()))?;
+        v.default_scene_id = scene_id;
+        Ok(())
+    })?;
+    Ok(())
+}
+
 pub fn set_video_state(folder: &Path, video_id: &str, state_id: &str) -> Result<()> {
     mutate_course(folder, |c| {
         if !c.workflow_states.iter().any(|s| s.id == state_id) {
@@ -362,6 +392,7 @@ pub fn add_video(folder: &Path, module_id: &str, title: &str) -> Result<Video> {
             id: new_id(),
             title: title.to_string(),
             state_id: initial_state,
+            default_scene_id: None,
         };
         m.video_ids.push(video.id.clone());
         added = Some(video.clone());
@@ -1082,5 +1113,60 @@ mod tests {
             .collect();
         assert!(entries.iter().any(|n| n == COURSE_JSON));
         assert!(!entries.iter().any(|n| n.to_string_lossy().ends_with(".tmp")));
+    }
+
+    #[test]
+    fn pin_default_scene_records_the_scene_id_on_the_video() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "M").unwrap();
+        let v = add_video(&folder, &m.id, "V").unwrap();
+        // Brand-new videos start without a pinned Scene.
+        assert_eq!(v.default_scene_id, None);
+        pin_default_scene(&folder, &v.id, Some("scene-abc".into())).unwrap();
+        let on_disk = read_course(&folder).unwrap();
+        assert_eq!(on_disk.videos[0].default_scene_id.as_deref(), Some("scene-abc"));
+    }
+
+    #[test]
+    fn pin_default_scene_with_none_clears_the_pin() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "M").unwrap();
+        let v = add_video(&folder, &m.id, "V").unwrap();
+        pin_default_scene(&folder, &v.id, Some("scene-abc".into())).unwrap();
+        pin_default_scene(&folder, &v.id, None).unwrap();
+        assert_eq!(read_course(&folder).unwrap().videos[0].default_scene_id, None);
+    }
+
+    #[test]
+    fn pin_default_scene_with_empty_string_also_clears_the_pin() {
+        // Frontend convenience — saves a separate unpin command.
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "M").unwrap();
+        let v = add_video(&folder, &m.id, "V").unwrap();
+        pin_default_scene(&folder, &v.id, Some("scene-abc".into())).unwrap();
+        pin_default_scene(&folder, &v.id, Some(String::new())).unwrap();
+        assert_eq!(read_course(&folder).unwrap().videos[0].default_scene_id, None);
+    }
+
+    #[test]
+    fn pin_default_scene_errors_on_unknown_video() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let err = pin_default_scene(&folder, "nope", Some("s".into())).unwrap_err();
+        assert!(matches!(err, CoreError::VideoNotFound(_)));
+    }
+
+    #[test]
+    fn default_scene_id_is_omitted_from_json_when_none() {
+        // Keeps v1 Course Folders byte-identical when no Scene is pinned.
+        let root = tempfile::tempdir().unwrap();
+        let folder = create_course(root.path(), "C").unwrap();
+        let m = add_module(&folder, "M").unwrap();
+        let _v = add_video(&folder, &m.id, "V").unwrap();
+        let json = std::fs::read_to_string(folder.join(COURSE_JSON)).unwrap();
+        assert!(!json.contains("defaultSceneId"));
     }
 }

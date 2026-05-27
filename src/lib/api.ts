@@ -66,7 +66,15 @@ export const renameCourse = (folder: string, newTitle: string) =>
   invoke<string>('rename_course', { folder, newTitle });
 
 export type Module = { id: string; title: string; videoIds: string[] };
-export type Video = { id: string; title: string; stateId: string | null };
+export type Video = {
+  id: string;
+  title: string;
+  stateId: string | null;
+  /// Optional pinned default Scene (issue #35). Absent when the Video has
+  /// no pin — Record then opens the Scene picker (or falls back to the
+  /// legacy Screen+Mic synthetic request list when no Scenes exist at all).
+  defaultSceneId?: string;
+};
 export type WorkflowState = { id: string; name: string };
 export type Course = {
   schemaVersion: number;
@@ -270,6 +278,35 @@ export const startRecording = (
     requests
   });
 
+/// Issue #35 — Scene-driven recording. The backend reads the Scene,
+/// validates each non-"default" device against the live device list, and
+/// builds the `Vec<CaptureRequest>` itself. A missing device fails
+/// pre-Start with a per-source diagnostic.
+export const startRecordingWithScene = (
+  folder: string,
+  videoId: string,
+  sceneId: string
+) =>
+  invoke<SessionSnapshot>('start_recording_with_scene', {
+    folder,
+    videoId,
+    sceneId
+  });
+
+/// Pin (or unpin with `null`) the default Scene used by Record for one
+/// Video. Persists in course.json so the choice survives a Course Folder
+/// copy.
+export const pinDefaultScene = (
+  folder: string,
+  videoId: string,
+  sceneId: string | null
+) =>
+  invoke<void>('pin_default_scene', {
+    folder,
+    videoId,
+    sceneId
+  });
+
 export const pauseRecording = (sessionId: string) =>
   invoke<SessionSnapshot>('pause_recording', { sessionId });
 
@@ -279,8 +316,11 @@ export const resumeRecording = (sessionId: string) =>
 export const stopRecording = (sessionId: string) =>
   invoke<SessionSnapshot>('stop_recording', { sessionId });
 
+/// Issue #36 — Keep promotes every per-source partial in the Take to its
+/// final name and writes a per-Segment sidecar each. Returns one Segment
+/// record per slot so the UI can refresh its per-Video Segment list.
 export const keepSegment = (sessionId: string) =>
-  invoke<Segment>('keep_segment', { sessionId });
+  invoke<Segment[]>('keep_segment', { sessionId });
 
 export const discardSegment = (sessionId: string) =>
   invoke<void>('discard_segment', { sessionId });
@@ -302,6 +342,143 @@ export const importOrphanSegment = (folder: string, videoId: string, segmentId: 
 
 export const discardOrphanSegment = (folder: string, videoId: string, segmentId: string) =>
   invoke<void>('discard_orphan_segment', { folder, videoId, segmentId });
+
+// --- Per-Take orphan recovery (issue #38) ---
+
+export type OrphanTakeSegment = {
+  segmentId: string;
+  sourceRole: SourceRole;
+  partialPath: string;
+};
+
+export type OrphanTake = {
+  takeId: string;
+  videoId: string;
+  /// ISO-8601 timestamp from the Take marker, or null for v1 legacy
+  /// orphans that predate Take markers.
+  recordedAt: string | null;
+  sceneId: string | null;
+  segments: OrphanTakeSegment[];
+};
+
+export const scanOrphanTakes = (folder: string) =>
+  invoke<OrphanTake[]>('scan_orphan_takes', { folder });
+
+export const importOrphanTake = (folder: string, videoId: string, takeId: string) =>
+  invoke<Segment[]>('import_orphan_take', { folder, videoId, takeId });
+
+export const discardOrphanTake = (folder: string, videoId: string, takeId: string) =>
+  invoke<void>('discard_orphan_take', { folder, videoId, takeId });
+
+// ---------------------------------------------------------------------------
+// Scenes (Phase 2 — issue #33)
+// ---------------------------------------------------------------------------
+
+export type SceneSource = {
+  role: SourceRole;
+  device: Device;
+  defaults: CompositionDefaults;
+  /// Issue #40 — radio-style flag (at most one per Scene). When true,
+  /// this source's audio is the Take's Transcript Source. v1 / pre-#40
+  /// Scenes deserialise this as undefined; the frontend treats that as
+  /// `false`.
+  isTranscriptSource?: boolean;
+};
+
+export type Scene = {
+  id: string;
+  name: string;
+  sources: SceneSource[];
+};
+
+export const listScenes = (folder: string) =>
+  invoke<Scene[]>('list_scenes', { folder });
+
+export const createScene = (folder: string, name: string) =>
+  invoke<Scene>('create_scene', { folder, name });
+
+export const renameScene = (folder: string, sceneId: string, newName: string) =>
+  invoke<void>('rename_scene', { folder, sceneId, newName });
+
+export const duplicateScene = (folder: string, sceneId: string) =>
+  invoke<Scene>('duplicate_scene', { folder, sceneId });
+
+export const deleteScene = (folder: string, sceneId: string) =>
+  invoke<void>('delete_scene', { folder, sceneId });
+
+export const addSceneSource = (folder: string, sceneId: string, role: SourceRole) =>
+  invoke<SceneSource>('add_scene_source', { folder, sceneId, role });
+
+export const removeSceneSource = (folder: string, sceneId: string, sourceIndex: number) =>
+  invoke<void>('remove_scene_source', { folder, sceneId, sourceIndex });
+
+export const setSceneSourceDevice = (
+  folder: string,
+  sceneId: string,
+  sourceIndex: number,
+  device: Device
+) =>
+  invoke<SceneSource>('set_scene_source_device', {
+    folder,
+    sceneId,
+    sourceIndex,
+    device
+  });
+
+/// Persist composition defaults (position/scale/opacity/audioGainDb)
+/// for one source row in a Scene. Issue #39 — debounced on the frontend.
+export const setSceneSourceDefaults = (
+  folder: string,
+  sceneId: string,
+  sourceIndex: number,
+  defaults: CompositionDefaults
+) =>
+  invoke<SceneSource>('set_scene_source_defaults', {
+    folder,
+    sceneId,
+    sourceIndex,
+    defaults
+  });
+
+/// Move one source row to a different index inside its Scene. Row order
+/// doubles as canvas z-order — later rows paint on top of earlier ones.
+export const reorderSceneSource = (
+  folder: string,
+  sceneId: string,
+  fromIndex: number,
+  toIndex: number
+) =>
+  invoke<void>('reorder_scene_source', {
+    folder,
+    sceneId,
+    fromIndex,
+    toIndex
+  });
+
+/// Issue #40 — designate exactly one source row as the Take's Transcript
+/// Source. Every other row's flag is cleared in the same write. The
+/// target row must produce audio (`microphone` / `systemAudio`).
+export const setSceneTranscriptSource = (
+  folder: string,
+  sceneId: string,
+  sourceIndex: number
+) =>
+  invoke<SceneSource>('set_scene_transcript_source', {
+    folder,
+    sceneId,
+    sourceIndex
+  });
+
+/// Live device enumeration per role (issue #34). Queries SCK /
+/// AVCaptureDevice at call time so USB / Continuity Camera changes show up
+/// on Refresh. An empty list is not an error — the host just has no
+/// hardware of that role attached.
+export const listCaptureDevices = (role: SourceRole) =>
+  invoke<Device[]>('list_capture_devices', { role });
+
+/// The "use the system default" entry every dropdown carries — keeps
+/// Device.id == "default" so Scenes stay portable across machines.
+export const DEFAULT_DEVICE: Device = { id: 'default', label: 'Default' };
 
 // ---------------------------------------------------------------------------
 // Transcription

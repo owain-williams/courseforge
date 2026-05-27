@@ -1,12 +1,14 @@
 pub mod capture;
 pub mod config;
 pub mod course;
+pub mod devices;
 pub mod edits;
 pub mod error;
 pub mod export;
 pub mod library;
 pub mod permissions;
 pub mod recording;
+pub mod scenes;
 pub mod segments;
 pub mod slug;
 pub mod transcript;

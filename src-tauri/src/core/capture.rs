@@ -20,6 +20,26 @@ pub enum SourceRole {
     SystemAudio,
 }
 
+impl SourceRole {
+    /// True iff the role produces audio samples only (no video track). Used
+    /// by the recorder to pick the right output container — audio-only
+    /// sources land in `.m4a`, video-and-audio sources in `.mov`.
+    pub fn is_audio_only(self) -> bool {
+        matches!(self, SourceRole::Microphone | SourceRole::SystemAudio)
+    }
+
+    /// True iff the role is sourced from ScreenCaptureKit (screen, window,
+    /// system audio). The Phase 2 backend routes these through one
+    /// `SCStream` per source. Camera and Microphone go through
+    /// `AVCaptureSession` instead.
+    pub fn is_sck_sourced(self) -> bool {
+        matches!(
+            self,
+            SourceRole::Screen | SourceRole::Window | SourceRole::SystemAudio
+        )
+    }
+}
+
 /// A specific device the user picked to back a [`SourceRole`]. The id is
 /// opaque to this layer — for screens it's a `CGDirectDisplayID` stringified;
 /// for AVCaptureSession devices it's the device's uniqueID; for "default"
@@ -89,6 +109,16 @@ pub struct CaptureRequest {
     pub device: Device,
     #[serde(default)]
     pub defaults: CompositionDefaults,
+    /// Issue #40 — whether this source is the Scene's designated
+    /// Transcript Source. Defaults to `false` so v1 Course Folders and
+    /// pre-Phase-2 capture flows stay byte-identical. Phase 6 uses this
+    /// flag to filter which audio Segments get sent to the transcriber.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_transcript_source: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// How a Segment's recording ended. Written into the sidecar JSON so the
@@ -126,6 +156,20 @@ pub struct SegmentSidecar {
     pub recorded_at: String,
     pub defaults: CompositionDefaults,
     pub ended_reason: EndedReason,
+    /// Issue #40 — was this Segment captured from the Scene's Transcript
+    /// Source slot? Snapshotted at Capture time so Phase 6's transcriber
+    /// filter can decide without re-loading the Scene. Defaults to
+    /// `false` (omitted from JSON) so v1 Course Folders stay
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_transcript_source: bool,
+    /// ISO-8601 UTC timestamp the source's recording ended. Issue #37
+    /// records this on mid-Take per-source failure so the editor (and the
+    /// user) can tell when one source dropped while the rest of the Take
+    /// kept going. `None` is the v1-compatible "we didn't track it" state
+    /// — readers should fall back to the file's mtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
 }
 
 impl SegmentSidecar {
@@ -147,7 +191,24 @@ impl SegmentSidecar {
             recorded_at: recorded_at.into(),
             defaults,
             ended_reason,
+            is_transcript_source: false,
+            ended_at: None,
         }
+    }
+
+    /// Tag the sidecar as the Take's Transcript Source slot — Phase 6's
+    /// filter reads this back instead of re-loading the Scene.
+    pub fn with_transcript_source(mut self, flag: bool) -> Self {
+        self.is_transcript_source = flag;
+        self
+    }
+
+    /// Tag the sidecar with an explicit end timestamp — used for mid-Take
+    /// per-source failures (issue #37) so the editor can show "this source
+    /// dropped at 12:34:56" vs the Take's full duration.
+    pub fn with_ended_at(mut self, ended_at: impl Into<String>) -> Self {
+        self.ended_at = Some(ended_at.into());
+        self
     }
 }
 
@@ -251,6 +312,7 @@ mod tests {
                 label: "Main Display".into(),
             },
             defaults: CompositionDefaults::default(),
+            is_transcript_source: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: CaptureRequest = serde_json::from_str(&json).unwrap();

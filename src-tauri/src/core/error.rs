@@ -31,6 +31,36 @@ pub enum CoreError {
         source: serde_json::Error,
     },
 
+    #[error("invalid scenes.json at {path}: {source}")]
+    InvalidScenesJson {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("scene not found: {0}")]
+    SceneNotFound(String),
+
+    #[error("scene source index {index} out of bounds for scene {scene_id} (len {len})")]
+    SceneSourceIndexOutOfBounds {
+        scene_id: String,
+        index: usize,
+        len: usize,
+    },
+
+    #[error("scene \"{scene_name}\" has no sources to record")]
+    SceneHasNoSources { scene_name: String },
+
+    #[error(
+        "scene \"{scene_name}\" expects {role} device \"{device_label}\" ({device_id}) but it's not currently attached"
+    )]
+    SceneDeviceMissing {
+        scene_name: String,
+        role: String,
+        device_label: String,
+        device_id: String,
+    },
+
     #[error("invalid cut: end ({end}) must be greater than start ({start})")]
     InvalidCut { start: f64, end: f64 },
 

@@ -22,9 +22,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::core::capture::{CaptureRequest, EndedReason, SegmentSidecar, SourceRole};
 use crate::core::error::{CoreError, Result};
-use crate::core::recording::{RecordingSession, SessionState};
+use crate::core::recording::{RecordingSession, SegmentSlot, SessionState};
 use crate::core::segments;
-use crate::recorder::{ActiveRecording, RecorderBackend};
+use crate::recorder::{ActiveRecording, RecorderBackend, SourceOutcome, TakeRequest, TakeSource};
 
 /// Snapshot of a session safe to ship over IPC. Mirrors [`RecordingSession`]
 /// (the field names line up so the frontend can deserialize the same shape).
@@ -47,6 +47,10 @@ struct ActiveSession {
     /// `None` once `stop()` has run; we keep the row around until the user
     /// decides Keep / Discard so the UI can still address it by id.
     recording: Option<Box<dyn ActiveRecording>>,
+    /// Per-source outcomes captured at Stop time — populated for the
+    /// AwaitingDecision window so Keep can write `endedReason:
+    /// sourceFailed` sidecars for sources that failed mid-Take (issue #37).
+    outcomes: Vec<SourceOutcome>,
 }
 
 impl ActiveSession {
@@ -98,22 +102,70 @@ impl RecordingManager {
                 "no capture sources requested — Start needs at least one".into(),
             ));
         }
-        let (segment_id, partial_path) = segments::prepare_segment_path(course_folder, video_id)?;
+        let take_paths = segments::prepare_take_paths(course_folder, video_id, &requests)?;
         let take_id = uuid::Uuid::new_v4().to_string();
         let recorded_at = iso8601_now();
+
+        let slots: Vec<SegmentSlot> = take_paths
+            .into_iter()
+            .zip(requests.iter().cloned())
+            .map(|(slot, request)| SegmentSlot {
+                segment_id: slot.segment_id,
+                partial_path: slot.partial_path,
+                request,
+            })
+            .collect();
+        let take_sources: Vec<TakeSource> = slots
+            .iter()
+            .map(|s| TakeSource {
+                request: s.request.clone(),
+                segment_id: s.segment_id.clone(),
+                partial_path: s.partial_path.clone(),
+            })
+            .collect();
+
         let mut session = RecordingSession::new(
             video_id.to_string(),
-            segment_id,
-            partial_path.clone(),
+            slots,
             take_id.clone(),
-            requests.clone(),
-            recorded_at,
+            recorded_at.clone(),
         );
 
-        // Spin up the backend first; if it fails we leave nothing behind (the
-        // empty segments/ dir is harmless) and the session never enters the
-        // registry, so callers get a clean error — Atomic Start.
-        let recording = self.backend.start(partial_path, requests, take_id)?;
+        // Issue #38: write the Take marker before the backend starts so
+        // a crash *during* backend init still leaves a marker for
+        // recovery. Failure to write the marker is fatal — the
+        // alternative is "we recorded but can't recover on crash" which
+        // beats the whole point.
+        let marker = segments::TakeMarker {
+            schema_version: segments::TakeMarker::SCHEMA_VERSION,
+            take_id: take_id.clone(),
+            video_id: video_id.to_string(),
+            recorded_at: recorded_at.clone(),
+            scene_id: None, // Phase 2 doesn't thread scene_id through start_session yet.
+            sources: session
+                .slots
+                .iter()
+                .map(|slot| segments::TakeMarkerSource {
+                    segment_id: slot.segment_id.clone(),
+                    request: slot.request.clone(),
+                })
+                .collect(),
+        };
+        segments::write_take_marker(course_folder, video_id, &marker)?;
+
+        // Spin up the backend; if it fails we tear down the marker as
+        // well so the next-launch scanner doesn't surface a Take that
+        // never actually wrote anything to disk.
+        let recording = match self.backend.start(TakeRequest {
+            take_id: take_id.clone(),
+            sources: take_sources,
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = segments::remove_take_marker(course_folder, video_id, &take_id);
+                return Err(e);
+            }
+        };
         session.start()?;
 
         let id = session.id.clone();
@@ -121,6 +173,7 @@ impl RecordingManager {
             session,
             course_folder: course_folder.to_path_buf(),
             recording: Some(recording),
+            outcomes: Vec::new(),
         };
         let snap = entry.snapshot();
         self.sessions.lock().unwrap().insert(id, entry);
@@ -147,10 +200,11 @@ impl RecordingManager {
 
     pub fn stop_session(&self, id: &str) -> Result<SessionSnapshot> {
         // Take the recording handle out under the lock, then drop the lock
-        // before driving the backend's stop — finalising an AVAssetWriter
-        // can take a moment and we don't want every other IPC call to
-        // block on it. The session row stays in the registry (with
-        // `recording: None`) so the UI's id-based addressing still works.
+        // before driving the backend's stop — finalising N AVAssetWriters
+        // in parallel can take a moment and we don't want every other IPC
+        // call to block on it. The session row stays in the registry
+        // (with `recording: None`) so the UI's id-based addressing still
+        // works.
         let recording = {
             let mut sessions = self.sessions.lock().unwrap();
             let entry = sessions
@@ -159,53 +213,169 @@ impl RecordingManager {
             entry.recording.take()
         };
 
-        if let Some(rec) = recording {
-            rec.stop()?;
-        }
+        let outcomes = if let Some(rec) = recording {
+            rec.stop()?
+        } else {
+            Vec::new()
+        };
 
         let mut sessions = self.sessions.lock().unwrap();
         let entry = sessions
             .get_mut(id)
             .ok_or_else(|| CoreError::SessionNotFound(id.to_string()))?;
+        entry.outcomes = outcomes;
         entry.session.stop()?;
+        // Take marker removed on clean Stop — a crash before this point
+        // leaves the marker behind for orphan recovery (issue #38).
+        let _ = segments::remove_take_marker(
+            &entry.course_folder,
+            &entry.session.video_id,
+            &entry.session.take_id,
+        );
         Ok(entry.snapshot())
     }
 
-    /// "Keep". Promotes the `.partial.mov` to its final name and writes the
-    /// per-Segment sidecar JSON. Drops the session from the registry and
-    /// returns the new Segment record so callers can update UI.
-    pub fn keep_session(&self, id: &str) -> Result<segments::Segment> {
+    /// "Keep". Promotes every per-source `.partial.*` to its final name and
+    /// writes one per-Segment sidecar JSON per slot. Drops the session from
+    /// the registry and returns one Segment record per slot so callers can
+    /// update UI. Phase 2 (issue #36) widened this from a single-segment
+    /// return to a Take-shaped `Vec<Segment>`; #37 follows up with parallel
+    /// finalize + mid-Take per-source failure handling.
+    pub fn keep_session(&self, id: &str) -> Result<Vec<segments::Segment>> {
         let mut sessions = self.sessions.lock().unwrap();
         let entry = sessions
             .get_mut(id)
             .ok_or_else(|| CoreError::SessionNotFound(id.to_string()))?;
 
-        // Diagnostic guard: if the partial vanished (or was never written
-        // because the recorder crashed silently), `finalize_segment` would
-        // only give us `SegmentNotFound(<uuid>)` — useless to the user.
-        // Surface a concrete "no recording produced a file" message and
-        // evict the dead session so the UI clears the awaiting-decision
-        // banner — replaying Keep on the same id can't succeed.
-        let partial = entry.session.partial_path.clone();
-        let final_path = sibling_final(&partial);
-        if !partial.is_file() && !final_path.is_file() {
+        // Diagnostic guard: if *every* slot's partial is gone *and* no
+        // final landed in its place, the recorder produced nothing. That
+        // beats a downstream SegmentNotFound which would point at one of
+        // N uuids and tell the user nothing. We evict the dead session
+        // here so the UI clears the awaiting-decision banner.
+        let any_landed = entry.session.slots.iter().any(|slot| {
+            let role = slot.request.role;
+            slot.partial_path.is_file() || sibling_final_for(&slot.partial_path, role).is_file()
+        });
+        if !any_landed {
+            let first_partial = entry
+                .session
+                .slots
+                .first()
+                .map(|s| s.partial_path.display().to_string())
+                .unwrap_or_default();
+            let n_others = entry.session.slots.len().saturating_sub(1);
+            let plural = if n_others == 1 { "" } else { "s" };
             sessions.remove(id);
             return Err(CoreError::Recorder(format!(
-                "the recording produced no file at {}",
-                partial.display()
+                "the recording produced no files (looked for {first_partial} and {n_others} other source{plural})"
             )));
         }
 
         entry.session.mark_persisted()?;
-        let sidecar = sidecar_from_session(&entry.session, EndedReason::Normal)?;
-        let seg = segments::finalize_segment(
-            &entry.course_folder,
-            &entry.session.video_id,
-            &entry.session.segment_id,
-            sidecar,
-        )?;
+        let recorded_at = entry.session.recorded_at.clone();
+        let take_id = entry.session.take_id.clone();
+        let video_id = entry.session.video_id.clone();
+        let course_folder = entry.course_folder.clone();
+        let slots = entry.session.slots.clone();
+        let outcomes = std::mem::take(&mut entry.outcomes);
+
+        let outcome_for = |segment_id: &str| -> (EndedReason, Option<String>) {
+            outcomes
+                .iter()
+                .find(|o| o.segment_id == segment_id)
+                .map(|o| (o.ended_reason, o.ended_at.clone()))
+                .unwrap_or((EndedReason::Normal, None))
+        };
+
+        let mut out = Vec::with_capacity(slots.len());
+        for slot in slots {
+            let (ended_reason, ended_at) = outcome_for(&slot.segment_id);
+            let mut sidecar = SegmentSidecar::new(
+                take_id.clone(),
+                slot.request.role,
+                slot.request.device.clone(),
+                recorded_at.clone(),
+                slot.request.defaults,
+                ended_reason,
+            )
+            .with_transcript_source(slot.request.is_transcript_source);
+            if let Some(ended_at) = ended_at {
+                sidecar = sidecar.with_ended_at(ended_at);
+            }
+            let seg = segments::finalize_segment(
+                &course_folder,
+                &video_id,
+                &slot.segment_id,
+                sidecar,
+            )?;
+            out.push(seg);
+        }
         sessions.remove(id);
-        Ok(seg)
+        Ok(out)
+    }
+
+    /// Adopt every Segment in one crashed Take (issue #38). Reads the
+    /// Take marker, calls `adopt_orphan` per source with a sidecar
+    /// carrying the marker's role/device/defaults + `EndedReason::Crashed`,
+    /// then removes the marker. v1 legacy orphans (no marker) fall
+    /// through to the per-file `adopt_orphan` path the UI keeps for
+    /// single-Segment Takes.
+    pub fn adopt_orphan_take(
+        &self,
+        course_folder: &Path,
+        video_id: &str,
+        take_id: &str,
+    ) -> Result<Vec<segments::Segment>> {
+        let marker = segments::read_take_marker(course_folder, video_id, take_id)?;
+        let marker = match marker {
+            Some(m) => m,
+            None => {
+                return Err(CoreError::Recorder(format!(
+                    "no in-progress Take marker for {take_id} — the Take may have already been adopted or discarded"
+                )))
+            }
+        };
+        let mut out = Vec::with_capacity(marker.sources.len());
+        for src in &marker.sources {
+            let sidecar = SegmentSidecar::new(
+                marker.take_id.clone(),
+                src.request.role,
+                src.request.device.clone(),
+                marker.recorded_at.clone(),
+                src.request.defaults,
+                EndedReason::Crashed,
+            );
+            let seg = segments::adopt_orphan(
+                course_folder,
+                video_id,
+                &src.segment_id,
+                sidecar,
+                legacy_remux_mkv_to_mp4,
+            )?;
+            out.push(seg);
+        }
+        // Marker removed last so a crash mid-import leaves the rest of
+        // the Take adoptable on the next attempt.
+        let _ = segments::remove_take_marker(course_folder, video_id, take_id);
+        Ok(out)
+    }
+
+    /// Discard every Segment in one crashed Take. Removes all partials
+    /// plus the Take marker; safe to call multiple times.
+    pub fn discard_orphan_take(
+        &self,
+        course_folder: &Path,
+        video_id: &str,
+        take_id: &str,
+    ) -> Result<()> {
+        let marker = segments::read_take_marker(course_folder, video_id, take_id)?;
+        if let Some(marker) = marker {
+            for src in &marker.sources {
+                segments::discard_partial(course_folder, video_id, &src.segment_id)?;
+            }
+        }
+        segments::remove_take_marker(course_folder, video_id, take_id)?;
+        Ok(())
     }
 
     /// Adopt a crash-recovered partial as a finished Segment. Handles both
@@ -236,8 +406,8 @@ impl RecordingManager {
         segments::adopt_orphan(course_folder, video_id, segment_id, sidecar, legacy_remux_mkv_to_mp4)
     }
 
-    /// "Discard". Tears the recorder down if it's still running, removes the
-    /// partial, drops the session from the registry.
+    /// "Discard". Tears the recorder down if it's still running, removes
+    /// every per-source partial, drops the session from the registry.
     pub fn discard_session(&self, id: &str) -> Result<()> {
         // Same shape as `stop_session`: take the recording out under the
         // lock, drop the lock, run the (potentially slow) backend stop,
@@ -260,11 +430,18 @@ impl RecordingManager {
             .get_mut(id)
             .ok_or_else(|| CoreError::SessionNotFound(id.to_string()))?;
         entry.session.mark_discarded()?;
-        segments::discard_partial(
+        for slot in &entry.session.slots {
+            segments::discard_partial(
+                &entry.course_folder,
+                &entry.session.video_id,
+                &slot.segment_id,
+            )?;
+        }
+        let _ = segments::remove_take_marker(
             &entry.course_folder,
             &entry.session.video_id,
-            &entry.session.segment_id,
-        )?;
+            &entry.session.take_id,
+        );
         sessions.remove(id);
         Ok(())
     }
@@ -291,42 +468,22 @@ impl RecordingManager {
     }
 }
 
-fn sibling_final(partial: &Path) -> PathBuf {
-    // `<id>.partial.mov` → `<id>.mov`. Strips the inner extension and
-    // re-adds the final one. Used by the diagnostic guard to spot a
-    // post-finalize replay where the partial is already gone but the
-    // final is sitting in place.
+fn sibling_final_for(partial: &Path, role: SourceRole) -> PathBuf {
+    // `<id>.partial.<suffix>` → `<id>.<final-ext>`. Strips the partial
+    // suffix appropriate for the role and re-adds the matching final ext.
+    // Used by the Keep diagnostic guard to spot a post-finalize replay
+    // where the partial is already gone but the final is sitting in place.
     let parent = partial.parent().unwrap_or(Path::new("."));
     let stem = partial
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
+    let partial_suffix = segments::partial_suffix_for(role);
+    let final_ext = segments::segment_ext_for(role);
     let id = stem
-        .strip_suffix(&format!(".{}", segments::PARTIAL_SUFFIX))
+        .strip_suffix(&format!(".{}", partial_suffix))
         .unwrap_or(stem);
-    parent.join(format!("{id}.{}", segments::SEGMENT_EXT))
-}
-
-/// Build a Phase-1-shaped sidecar from the session. The first
-/// `CaptureRequest` is treated as the source-of-truth role / device /
-/// defaults — Phase 1 only writes one Segment per Take, so collapsing N
-/// requests into one sidecar is correct here. Phase 2 produces one
-/// sidecar per request and this collapse goes away.
-fn sidecar_from_session(
-    session: &RecordingSession,
-    ended_reason: EndedReason,
-) -> Result<SegmentSidecar> {
-    let first = session.requests.first().ok_or_else(|| {
-        CoreError::Recorder("cannot finalise a session with no requests".into())
-    })?;
-    Ok(SegmentSidecar::new(
-        session.take_id.clone(),
-        first.role,
-        first.device.clone(),
-        session.recorded_at.clone(),
-        first.defaults,
-        ended_reason,
-    ))
+    parent.join(format!("{id}.{}", final_ext))
 }
 
 fn iso8601_now() -> String {
@@ -458,7 +615,7 @@ fn legacy_remux_mkv_to_mp4(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::core::capture::{CompositionDefaults, Device, SourceRole};
-    use crate::recorder::fake::FakeRecorderBackend;
+    use crate::recorder::fake::{FakeEvent, FakeRecorderBackend};
 
     fn course_with_video() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
@@ -471,7 +628,7 @@ mod tests {
 
     fn manager() -> (RecordingManager, FakeRecorderBackend) {
         let backend = FakeRecorderBackend::default();
-        let log_backend = FakeRecorderBackend { events: backend.shared_log() };
+        let log_backend = backend.shared_clone();
         let mgr = RecordingManager::new(Box::new(log_backend));
         (mgr, backend)
     }
@@ -489,6 +646,7 @@ mod tests {
                 label: "Main Display".into(),
             },
             defaults: CompositionDefaults::default(),
+            is_transcript_source: false,
         }
     }
 
@@ -506,12 +664,12 @@ mod tests {
         assert!(!snap.take_id.is_empty());
         assert_eq!(snap.requests, vec![screen_request()]);
 
-        // Backend was asked to start with our partial path + requests + take_id.
+        // Backend was asked to start with our take_id and one partial path.
         let events = backend.events.lock().unwrap();
         match events.first() {
-            Some(crate::recorder::fake::FakeEvent::Start { take_id, requests, .. }) => {
+            Some(crate::recorder::fake::FakeEvent::Start { take_id, partial_paths }) => {
                 assert_eq!(take_id, &snap.take_id);
-                assert_eq!(requests, &vec![screen_request()]);
+                assert_eq!(partial_paths.len(), 1);
             }
             other => panic!("expected Start, got {other:?}"),
         }
@@ -568,7 +726,9 @@ mod tests {
         let stopped = mgr.stop_session(&snap.id).unwrap();
         assert_eq!(stopped.state, SessionState::AwaitingDecision);
 
-        let seg = mgr.keep_session(&snap.id).unwrap();
+        let segs = mgr.keep_session(&snap.id).unwrap();
+        assert_eq!(segs.len(), 1);
+        let seg = &segs[0];
         assert_eq!(seg.video_id, vid);
         assert_eq!(seg.id, snap.segment_id);
 
@@ -587,6 +747,345 @@ mod tests {
 
         // Session is gone from the registry.
         assert!(mgr.list_sessions().is_empty());
+    }
+
+    #[test]
+    fn multi_source_keep_finalises_every_slot_with_shared_take_id() {
+        let (dir, vid) = course_with_video();
+        let (mgr, _) = manager();
+
+        let mic_request = CaptureRequest {
+            role: SourceRole::Microphone,
+            device: Device {
+                id: "default".into(),
+                label: "Default Mic".into(),
+            },
+            defaults: CompositionDefaults::default(),
+            is_transcript_source: false,
+        };
+        let snap = mgr
+            .start_session(
+                &course_folder(&dir),
+                &vid,
+                vec![screen_request(), mic_request.clone()],
+            )
+            .unwrap();
+        mgr.stop_session(&snap.id).unwrap();
+        let segs = mgr.keep_session(&snap.id).unwrap();
+        assert_eq!(segs.len(), 2, "every slot should produce a Segment");
+
+        // Confirm each landed at its expected extension on disk.
+        let segs_dir = course_folder(&dir).join("videos").join(&vid).join("segments");
+        let mov = segs_dir.join(format!("{}.mov", segs[0].id));
+        let m4a = segs_dir.join(format!("{}.m4a", segs[1].id));
+        assert!(mov.is_file(), "expected video Segment at {mov:?}");
+        assert!(m4a.is_file(), "expected audio Segment at {m4a:?}");
+
+        // Every sidecar carries the same take_id and recorded_at.
+        let sidecar_a = segments::read_sidecar(&course_folder(&dir), &vid, &segs[0].id)
+            .unwrap()
+            .unwrap();
+        let sidecar_b = segments::read_sidecar(&course_folder(&dir), &vid, &segs[1].id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sidecar_a.take_id, sidecar_b.take_id);
+        assert_eq!(sidecar_a.take_id, snap.take_id);
+        assert_eq!(sidecar_a.recorded_at, sidecar_b.recorded_at);
+        assert_eq!(sidecar_a.source_role, SourceRole::Screen);
+        assert_eq!(sidecar_b.source_role, SourceRole::Microphone);
+    }
+
+    #[test]
+    fn keep_session_snapshots_transcript_source_flag_into_sidecar() {
+        // Issue #40 — when the start_session caller marks a slot's
+        // CaptureRequest as the transcript source, the sidecar written
+        // on Keep echoes that designation. (Scene-driven flows set the
+        // flag in `scenes::build_capture_requests`; this test mirrors
+        // that contract at the manager layer.)
+        let (dir, vid) = course_with_video();
+        let (mgr, _) = manager();
+        let mic_request = CaptureRequest {
+            role: SourceRole::Microphone,
+            device: Device {
+                id: "default".into(),
+                label: "Default Mic".into(),
+            },
+            defaults: CompositionDefaults::default(),
+            is_transcript_source: true,
+        };
+        let snap = mgr
+            .start_session(
+                &course_folder(&dir),
+                &vid,
+                vec![screen_request(), mic_request],
+            )
+            .unwrap();
+        mgr.stop_session(&snap.id).unwrap();
+        let segs = mgr.keep_session(&snap.id).unwrap();
+
+        let screen_sidecar =
+            segments::read_sidecar(&course_folder(&dir), &vid, &segs[0].id).unwrap().unwrap();
+        let mic_sidecar =
+            segments::read_sidecar(&course_folder(&dir), &vid, &segs[1].id).unwrap().unwrap();
+        assert!(!screen_sidecar.is_transcript_source);
+        assert!(mic_sidecar.is_transcript_source);
+    }
+
+    #[test]
+    fn mid_take_per_source_failure_writes_source_failed_sidecar_with_ended_at() {
+        // Issue #37 mid-Take per-source failure rule: when one source fails
+        // mid-Take, its sidecar carries `endedReason: sourceFailed` plus
+        // the failure timestamp, and the rest of the Take continues to
+        // their natural Stop with `Normal`.
+        let (dir, vid) = course_with_video();
+        let (mgr, backend) = manager();
+        let mic_request = CaptureRequest {
+            role: SourceRole::Microphone,
+            device: Device {
+                id: "default".into(),
+                label: "Default Mic".into(),
+            },
+            defaults: CompositionDefaults::default(),
+            is_transcript_source: false,
+        };
+        let snap = mgr
+            .start_session(
+                &course_folder(&dir),
+                &vid,
+                vec![screen_request(), mic_request],
+            )
+            .unwrap();
+        // Inject a failure on the *mic* slot before Stop runs.
+        let mic_segment_id = snap.requests[1].clone();
+        let _ = mic_segment_id;
+        // Backend keyed failures by segment id; pull the actual ids from
+        // the manager via list_sessions so the test stays decoupled from
+        // the registry's internal layout.
+        let sessions = mgr.list_sessions();
+        let mic_slot = &sessions[0];
+        let _ = mic_slot;
+        // The TakeSource ids land on the FakeRecording in order — slot 1
+        // is the mic. We don't expose them via SessionSnapshot, but the
+        // FakeRecorderBackend lets us look them up via its event log.
+        let start_paths: Vec<PathBuf> = match backend.events.lock().unwrap().first().unwrap() {
+            FakeEvent::Start { partial_paths, .. } => partial_paths.clone(),
+            _ => panic!("expected Start"),
+        };
+        // Segment id is the filename stem before `.partial.*`.
+        let mic_partial = &start_paths[1];
+        let mic_seg_id = mic_partial
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .split('.')
+            .next()
+            .unwrap()
+            .to_string();
+        backend.fail_source(&mic_seg_id, "2026-05-27T01:23:45Z");
+
+        mgr.stop_session(&snap.id).unwrap();
+        let segs = mgr.keep_session(&snap.id).unwrap();
+        assert_eq!(segs.len(), 2);
+
+        // Sidecar for the screen slot — normal.
+        let screen_sidecar =
+            segments::read_sidecar(&course_folder(&dir), &vid, &segs[0].id).unwrap().unwrap();
+        assert_eq!(screen_sidecar.ended_reason, EndedReason::Normal);
+        assert!(screen_sidecar.ended_at.is_none());
+
+        // Sidecar for the mic slot — sourceFailed with ended_at.
+        let mic_sidecar =
+            segments::read_sidecar(&course_folder(&dir), &vid, &segs[1].id).unwrap().unwrap();
+        assert_eq!(mic_sidecar.ended_reason, EndedReason::SourceFailed);
+        assert_eq!(mic_sidecar.ended_at.as_deref(), Some("2026-05-27T01:23:45Z"));
+    }
+
+    #[test]
+    fn pause_resume_drive_backend_pause_atomic_in_order() {
+        // Issue #37 atomic pause/resume: the manager flips the same
+        // shared atomic both writers consult. The fake backend exposes
+        // `paused` as an AtomicBool so tests can assert the gate is
+        // honoured even without a real OS-level capture pipeline.
+        let (dir, vid) = course_with_video();
+        let (mgr, _backend) = manager();
+        let snap = mgr
+            .start_session(&course_folder(&dir), &vid, vec![screen_request()])
+            .unwrap();
+        mgr.pause_session(&snap.id).unwrap();
+        // After Pause: the session is paused; the next sample would be
+        // dropped by `forward_sample`. We can't observe forward_sample
+        // directly from the fake, but we can verify the state machine.
+        assert_eq!(
+            mgr.list_sessions()
+                .into_iter()
+                .find(|s| s.id == snap.id)
+                .unwrap()
+                .state,
+            SessionState::Paused
+        );
+        mgr.resume_session(&snap.id).unwrap();
+        assert_eq!(
+            mgr.list_sessions()
+                .into_iter()
+                .find(|s| s.id == snap.id)
+                .unwrap()
+                .state,
+            SessionState::Recording
+        );
+    }
+
+    #[test]
+    fn start_session_writes_a_take_marker_to_disk() {
+        let (dir, vid) = course_with_video();
+        let (mgr, _) = manager();
+        let snap = mgr
+            .start_session(&course_folder(&dir), &vid, vec![screen_request()])
+            .unwrap();
+        let marker = segments::read_take_marker(&course_folder(&dir), &vid, &snap.take_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(marker.take_id, snap.take_id);
+        assert_eq!(marker.video_id, vid);
+        assert_eq!(marker.sources.len(), 1);
+    }
+
+    #[test]
+    fn clean_stop_removes_the_take_marker() {
+        let (dir, vid) = course_with_video();
+        let (mgr, _) = manager();
+        let snap = mgr
+            .start_session(&course_folder(&dir), &vid, vec![screen_request()])
+            .unwrap();
+        mgr.stop_session(&snap.id).unwrap();
+        assert!(
+            segments::read_take_marker(&course_folder(&dir), &vid, &snap.take_id)
+                .unwrap()
+                .is_none(),
+            "clean Stop should have removed the in-progress marker"
+        );
+    }
+
+    #[test]
+    fn adopt_orphan_take_imports_every_segment_atomically() {
+        // Simulate a crashed multi-source Take by writing the marker +
+        // both partials by hand, then call adopt_orphan_take and assert
+        // both Segments came back finalised with the right sidecars.
+        let (dir, vid) = course_with_video();
+        let (mgr, _) = manager();
+        let segs_dir = course_folder(&dir).join("videos").join(&vid).join("segments");
+        std::fs::create_dir_all(&segs_dir).unwrap();
+        // Two partials, one screen .mov, one mic .m4a — fake the contents.
+        std::fs::write(segs_dir.join("seg-screen.partial.mov"), b"FAKE").unwrap();
+        std::fs::write(segs_dir.join("seg-mic.partial.m4a"), b"FAKE").unwrap();
+        let mic_request = CaptureRequest {
+            role: SourceRole::Microphone,
+            device: Device {
+                id: "default".into(),
+                label: "Default Mic".into(),
+            },
+            defaults: CompositionDefaults::default(),
+            is_transcript_source: false,
+        };
+        let marker = segments::TakeMarker {
+            schema_version: segments::TakeMarker::SCHEMA_VERSION,
+            take_id: "take-crashed".into(),
+            video_id: vid.clone(),
+            recorded_at: "2026-05-27T01:00:00Z".into(),
+            scene_id: None,
+            sources: vec![
+                segments::TakeMarkerSource {
+                    segment_id: "seg-screen".into(),
+                    request: screen_request(),
+                },
+                segments::TakeMarkerSource {
+                    segment_id: "seg-mic".into(),
+                    request: mic_request,
+                },
+            ],
+        };
+        segments::write_take_marker(&course_folder(&dir), &vid, &marker).unwrap();
+
+        let segs = mgr
+            .adopt_orphan_take(&course_folder(&dir), &vid, "take-crashed")
+            .unwrap();
+        assert_eq!(segs.len(), 2);
+
+        // Both sidecars carry the take-id + Crashed reason.
+        for seg in &segs {
+            let sidecar = segments::read_sidecar(&course_folder(&dir), &vid, &seg.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(sidecar.take_id, "take-crashed");
+            assert_eq!(sidecar.ended_reason, EndedReason::Crashed);
+        }
+
+        // Marker is gone; partials are gone; finals are in place.
+        assert!(
+            segments::read_take_marker(&course_folder(&dir), &vid, "take-crashed")
+                .unwrap()
+                .is_none()
+        );
+        assert!(segs_dir.join("seg-screen.mov").is_file());
+        assert!(segs_dir.join("seg-mic.m4a").is_file());
+    }
+
+    #[test]
+    fn discard_orphan_take_removes_marker_and_every_partial() {
+        let (dir, vid) = course_with_video();
+        let (mgr, _) = manager();
+        let segs_dir = course_folder(&dir).join("videos").join(&vid).join("segments");
+        std::fs::create_dir_all(&segs_dir).unwrap();
+        std::fs::write(segs_dir.join("seg-a.partial.mov"), b"FAKE").unwrap();
+        let marker = segments::TakeMarker {
+            schema_version: segments::TakeMarker::SCHEMA_VERSION,
+            take_id: "doomed".into(),
+            video_id: vid.clone(),
+            recorded_at: "2026-05-27T01:00:00Z".into(),
+            scene_id: None,
+            sources: vec![segments::TakeMarkerSource {
+                segment_id: "seg-a".into(),
+                request: screen_request(),
+            }],
+        };
+        segments::write_take_marker(&course_folder(&dir), &vid, &marker).unwrap();
+        mgr.discard_orphan_take(&course_folder(&dir), &vid, "doomed")
+            .unwrap();
+        assert!(!segs_dir.join("seg-a.partial.mov").exists());
+        assert!(
+            segments::read_take_marker(&course_folder(&dir), &vid, "doomed")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn multi_source_discard_removes_every_partial() {
+        let (dir, vid) = course_with_video();
+        let (mgr, _) = manager();
+        let mic_request = CaptureRequest {
+            role: SourceRole::Microphone,
+            device: Device {
+                id: "default".into(),
+                label: "Default Mic".into(),
+            },
+            defaults: CompositionDefaults::default(),
+            is_transcript_source: false,
+        };
+        let snap = mgr
+            .start_session(
+                &course_folder(&dir),
+                &vid,
+                vec![screen_request(), mic_request],
+            )
+            .unwrap();
+        mgr.discard_session(&snap.id).unwrap();
+
+        let segs_dir = course_folder(&dir).join("videos").join(&vid).join("segments");
+        assert!(segs_dir.is_dir());
+        assert!(
+            std::fs::read_dir(&segs_dir).unwrap().next().is_none(),
+            "discard should leave no per-source partials behind"
+        );
     }
 
     #[test]

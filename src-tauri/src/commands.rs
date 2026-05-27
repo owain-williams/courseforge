@@ -7,7 +7,10 @@ use crate::core::edits::{self, EditState};
 use crate::core::permissions::{
     self, PermissionsSnapshot, SettingsPane,
 };
-use crate::core::segments::{self, OrphanSegment, Segment};
+use crate::core::scenes::{self, Scene, SceneSource};
+use crate::core::capture::{CompositionDefaults, Device, SourceRole};
+use crate::core::devices;
+use crate::core::segments::{self, OrphanSegment, OrphanTake, Segment};
 use crate::core::transcript::{self, Transcript};
 use crate::export_manager::{ExportJob, ExportManager};
 use crate::recording_manager::{RecordingManager, SessionSnapshot};
@@ -321,6 +324,43 @@ pub fn start_recording(
     Ok(manager.start_session(&folder, &video_id, requests)?)
 }
 
+/// Start a recording driven by a Scene (issue #35). Builds the
+/// `Vec<CaptureRequest>` from the Scene's source rows, validates every
+/// non-"default" device against the live device list, and forwards to
+/// `start_recording`. Any pre-Start validation failure surfaces with a
+/// per-source diagnostic naming the missing device — the caller never
+/// touches the recorder.
+#[tauri::command]
+pub fn start_recording_with_scene(
+    manager: tauri::State<'_, RecordingManager>,
+    folder: PathBuf,
+    video_id: String,
+    scene_id: String,
+) -> Result<SessionSnapshot, AppError> {
+    let all = scenes::list_scenes(&folder)?;
+    let scene = all
+        .into_iter()
+        .find(|s| s.id == scene_id)
+        .ok_or_else(|| AppError {
+            message: format!("scene not found: {scene_id}"),
+        })?;
+    let mut live = std::collections::HashMap::new();
+    for role in scene.sources.iter().map(|s| s.role).collect::<std::collections::HashSet<_>>() {
+        live.insert(role, devices::list_capture_devices(role)?);
+    }
+    let requests = scenes::build_capture_requests(&scene, &live)?;
+    Ok(manager.start_session(&folder, &video_id, requests)?)
+}
+
+#[tauri::command]
+pub fn pin_default_scene(
+    folder: PathBuf,
+    video_id: String,
+    scene_id: Option<String>,
+) -> Result<(), AppError> {
+    Ok(course::pin_default_scene(&folder, &video_id, scene_id)?)
+}
+
 #[tauri::command]
 pub fn pause_recording(
     manager: tauri::State<'_, RecordingManager>,
@@ -350,18 +390,18 @@ pub fn keep_segment(
     manager: tauri::State<'_, RecordingManager>,
     transcription: tauri::State<'_, TranscriptionManager>,
     session_id: String,
-) -> Result<Segment, AppError> {
+) -> Result<Vec<Segment>, AppError> {
     // Snapshot the session so we know which Course/Video to transcribe
     // *before* keep_session evicts it from the registry.
     let sessions = manager.list_sessions();
     let snap = sessions.into_iter().find(|s| s.id == session_id);
 
-    let seg = manager.keep_session(&session_id)?;
+    let segs = manager.keep_session(&session_id)?;
 
     if let Some(snap) = snap {
         transcription.enqueue(snap.course_folder, snap.video_id);
     }
-    Ok(seg)
+    Ok(segs)
 }
 
 #[tauri::command]
@@ -415,6 +455,151 @@ pub fn discard_orphan_segment(
     segment_id: String,
 ) -> Result<(), AppError> {
     Ok(segments::discard_partial(&folder, &video_id, &segment_id)?)
+}
+
+// --- Per-Take orphan recovery (issue #38) ---
+
+#[tauri::command]
+pub fn scan_orphan_takes(folder: PathBuf) -> Result<Vec<OrphanTake>, AppError> {
+    Ok(segments::scan_orphan_takes(&folder)?)
+}
+
+#[tauri::command]
+pub fn import_orphan_take(
+    manager: tauri::State<'_, RecordingManager>,
+    transcription: tauri::State<'_, TranscriptionManager>,
+    folder: PathBuf,
+    video_id: String,
+    take_id: String,
+) -> Result<Vec<Segment>, AppError> {
+    let segs = manager.adopt_orphan_take(&folder, &video_id, &take_id)?;
+    // Queue transcription on the Video once for the whole Take.
+    transcription.enqueue(folder, video_id);
+    Ok(segs)
+}
+
+#[tauri::command]
+pub fn discard_orphan_take(
+    manager: tauri::State<'_, RecordingManager>,
+    folder: PathBuf,
+    video_id: String,
+    take_id: String,
+) -> Result<(), AppError> {
+    Ok(manager.discard_orphan_take(&folder, &video_id, &take_id)?)
+}
+
+// ---------------------------------------------------------------------------
+// Scenes
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn list_scenes(folder: PathBuf) -> Result<Vec<Scene>, AppError> {
+    Ok(scenes::list_scenes(&folder)?)
+}
+
+#[tauri::command]
+pub fn create_scene(folder: PathBuf, name: String) -> Result<Scene, AppError> {
+    Ok(scenes::create_scene(&folder, &name)?)
+}
+
+#[tauri::command]
+pub fn rename_scene(
+    folder: PathBuf,
+    scene_id: String,
+    new_name: String,
+) -> Result<(), AppError> {
+    Ok(scenes::rename_scene(&folder, &scene_id, &new_name)?)
+}
+
+#[tauri::command]
+pub fn duplicate_scene(folder: PathBuf, scene_id: String) -> Result<Scene, AppError> {
+    Ok(scenes::duplicate_scene(&folder, &scene_id)?)
+}
+
+#[tauri::command]
+pub fn delete_scene(folder: PathBuf, scene_id: String) -> Result<(), AppError> {
+    Ok(scenes::delete_scene(&folder, &scene_id)?)
+}
+
+#[tauri::command]
+pub fn add_scene_source(
+    folder: PathBuf,
+    scene_id: String,
+    role: SourceRole,
+) -> Result<SceneSource, AppError> {
+    Ok(scenes::add_scene_source(&folder, &scene_id, role)?)
+}
+
+#[tauri::command]
+pub fn remove_scene_source(
+    folder: PathBuf,
+    scene_id: String,
+    source_index: usize,
+) -> Result<(), AppError> {
+    Ok(scenes::remove_scene_source(&folder, &scene_id, source_index)?)
+}
+
+#[tauri::command]
+pub fn set_scene_source_device(
+    folder: PathBuf,
+    scene_id: String,
+    source_index: usize,
+    device: Device,
+) -> Result<SceneSource, AppError> {
+    Ok(scenes::set_scene_source_device(
+        &folder,
+        &scene_id,
+        source_index,
+        device,
+    )?)
+}
+
+#[tauri::command]
+pub fn list_capture_devices(role: SourceRole) -> Result<Vec<Device>, AppError> {
+    Ok(devices::list_capture_devices(role)?)
+}
+
+#[tauri::command]
+pub fn set_scene_source_defaults(
+    folder: PathBuf,
+    scene_id: String,
+    source_index: usize,
+    defaults: CompositionDefaults,
+) -> Result<SceneSource, AppError> {
+    Ok(scenes::set_scene_source_defaults(
+        &folder,
+        &scene_id,
+        source_index,
+        defaults,
+    )?)
+}
+
+#[tauri::command]
+pub fn reorder_scene_source(
+    folder: PathBuf,
+    scene_id: String,
+    from_index: usize,
+    to_index: usize,
+) -> Result<(), AppError> {
+    Ok(scenes::reorder_scene_source(
+        &folder,
+        &scene_id,
+        from_index,
+        to_index,
+    )?)
+}
+
+#[tauri::command]
+pub fn set_scene_transcript_source(
+    folder: PathBuf,
+    scene_id: String,
+    source_index: usize,
+) -> Result<SceneSource, AppError> {
+    Ok(scenes::set_scene_transcript_source(
+        &folder,
+        &scene_id,
+        source_index,
+    )?)
 }
 
 // ---------------------------------------------------------------------------

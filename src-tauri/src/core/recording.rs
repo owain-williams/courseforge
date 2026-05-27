@@ -57,12 +57,30 @@ impl SessionState {
     }
 }
 
+/// One source's slot inside a [`RecordingSession`] — Phase 2's multi-source
+/// shape. Each entry pairs a [`CaptureRequest`] with the segment id and
+/// `.partial.*` path the backend writes to. `segment_id` and
+/// `partial_path` are allocated by
+/// [`crate::core::segments::prepare_take_paths`] before Start.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentSlot {
+    pub segment_id: String,
+    pub partial_path: PathBuf,
+    pub request: CaptureRequest,
+}
+
 /// One Take. Lives in memory while the user is capturing; once in a terminal
-/// state it's safe to drop. The `partial_path` is allocated up front by
-/// [`crate::core::segments::prepare_segment_path`] so the recorder backend
-/// always has a destination to write to. `recorded_at` is captured at Start
-/// time so the per-Segment sidecar (written on Keep) carries an honest
-/// "when did this Take begin" rather than the Keep-decision timestamp.
+/// state it's safe to drop. Phase 2 grew this from one-slot-per-session to
+/// `Vec<SegmentSlot>` so multi-source Takes can be tracked end-to-end
+/// (issue #36). `recorded_at` is captured at Start time so every
+/// per-Segment sidecar (written on Keep) shares the same "when did this
+/// Take begin" timestamp.
+///
+/// The legacy single-slot accessors `segment_id` and `partial_path` are
+/// preserved as views into `slots[0]` so the existing serialised shape
+/// stays backwards-compatible with the manager's single-source happy path
+/// (which #37 replaces with parallel finalize across every slot).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordingSession {
@@ -72,6 +90,11 @@ pub struct RecordingSession {
     pub partial_path: PathBuf,
     pub take_id: String,
     pub requests: Vec<CaptureRequest>,
+    /// One slot per source. `slots.len() == requests.len()`; index `i` in
+    /// `slots` describes the segment id + partial path for the source in
+    /// `requests[i]`.
+    #[serde(default)]
+    pub slots: Vec<SegmentSlot>,
     /// ISO-8601 UTC timestamp the Take started.
     pub recorded_at: String,
     pub state: SessionState,
@@ -80,19 +103,26 @@ pub struct RecordingSession {
 impl RecordingSession {
     pub fn new(
         video_id: String,
-        segment_id: String,
-        partial_path: PathBuf,
+        slots: Vec<SegmentSlot>,
         take_id: String,
-        requests: Vec<CaptureRequest>,
         recorded_at: String,
     ) -> Self {
+        assert!(
+            !slots.is_empty(),
+            "RecordingSession requires at least one source slot"
+        );
+        let requests: Vec<CaptureRequest> = slots.iter().map(|s| s.request.clone()).collect();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             video_id,
-            segment_id,
-            partial_path,
+            // Primary-slot views — kept so the existing manager paths and
+            // the IPC contract stay backwards-compatible while #37 widens
+            // them to per-slot calls.
+            segment_id: slots[0].segment_id.clone(),
+            partial_path: slots[0].partial_path.clone(),
             take_id,
             requests,
+            slots,
             recorded_at,
             state: SessionState::Idle,
         }
@@ -179,16 +209,23 @@ mod tests {
                 label: "Main Display".into(),
             },
             defaults: CompositionDefaults::default(),
+            is_transcript_source: false,
+        }
+    }
+
+    fn screen_slot() -> SegmentSlot {
+        SegmentSlot {
+            segment_id: "seg-1".into(),
+            partial_path: PathBuf::from("/tmp/seg-1.partial.mov"),
+            request: screen_request(),
         }
     }
 
     fn session() -> RecordingSession {
         RecordingSession::new(
             "vid-1".into(),
-            "seg-1".into(),
-            PathBuf::from("/tmp/seg-1.partial.mov"),
+            vec![screen_slot()],
             "take-1".into(),
-            vec![screen_request()],
             "2026-05-26T12:00:00Z".into(),
         )
     }
@@ -201,8 +238,47 @@ mod tests {
         assert_eq!(s.segment_id, "seg-1");
         assert_eq!(s.take_id, "take-1");
         assert_eq!(s.requests, vec![screen_request()]);
+        assert_eq!(s.slots.len(), 1);
+        assert_eq!(s.slots[0].segment_id, "seg-1");
         assert!(!s.id.is_empty());
         assert_eq!(s.partial_path, PathBuf::from("/tmp/seg-1.partial.mov"));
+    }
+
+    #[test]
+    fn new_session_with_multiple_slots_indexes_into_requests_one_to_one() {
+        let cam_slot = SegmentSlot {
+            segment_id: "seg-cam".into(),
+            partial_path: PathBuf::from("/tmp/seg-cam.partial.mov"),
+            request: CaptureRequest {
+                role: SourceRole::Camera,
+                device: Device { id: "cam1".into(), label: "FaceTime".into() },
+                defaults: CompositionDefaults::default(),
+                is_transcript_source: false,
+            },
+        };
+        let mic_slot = SegmentSlot {
+            segment_id: "seg-mic".into(),
+            partial_path: PathBuf::from("/tmp/seg-mic.partial.m4a"),
+            request: CaptureRequest {
+                role: SourceRole::Microphone,
+                device: Device { id: "default".into(), label: "Default".into() },
+                defaults: CompositionDefaults::default(),
+                is_transcript_source: false,
+            },
+        };
+        let s = RecordingSession::new(
+            "vid-1".into(),
+            vec![screen_slot(), cam_slot.clone(), mic_slot.clone()],
+            "take-multi".into(),
+            "2026-05-26T12:00:00Z".into(),
+        );
+        assert_eq!(s.slots.len(), 3);
+        assert_eq!(s.requests.len(), 3);
+        for (slot, req) in s.slots.iter().zip(s.requests.iter()) {
+            assert_eq!(&slot.request, req);
+        }
+        // The primary-slot views point at slots[0] (the Screen source).
+        assert_eq!(s.segment_id, "seg-1");
     }
 
     #[test]

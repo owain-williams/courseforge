@@ -253,6 +253,7 @@ mod tests {
             role,
             device: Device { id: "default".into(), label: "Default".into() },
             defaults: CompositionDefaults::default(),
+            is_transcript_source: false,
         }
     }
 

@@ -23,6 +23,8 @@
     recordingPreflight,
     openSettingsPane,
     startRecording,
+    startRecordingWithScene,
+    pinDefaultScene,
     pauseRecording,
     resumeRecording,
     stopRecording,
@@ -34,6 +36,27 @@
     scanOrphanSegments,
     importOrphanSegment,
     discardOrphanSegment,
+    scanOrphanTakes,
+    importOrphanTake,
+    discardOrphanTake,
+    type OrphanTake,
+    listScenes,
+    createScene,
+    renameScene,
+    duplicateScene,
+    deleteScene,
+    addSceneSource,
+    removeSceneSource,
+    setSceneSourceDevice,
+    setSceneSourceDefaults,
+    reorderSceneSource,
+    setSceneTranscriptSource,
+    listCaptureDevices,
+    DEFAULT_DEVICE,
+    type CompositionDefaults,
+    type Scene,
+    type SourceRole,
+    type Device,
     listTranscriptionJobs,
     retryTranscription,
     getTranscript,
@@ -69,8 +92,413 @@
   let error = $state<string | null>(null);
   let busy = $state(false);
 
-  // Tree vs Board.
-  let view = $state<'tree' | 'board'>('tree');
+  // Tree vs Board vs Scenes.
+  let view = $state<'tree' | 'board' | 'scenes'>('tree');
+
+  // Scenes view state.
+  let scenes = $state<Scene[]>([]);
+  let scenesLoaded = $state(false);
+  let newSceneName = $state('');
+  let editingSceneId = $state<string | null>(null);
+  let editingSceneDraft = $state('');
+  // Per-Scene "add source" picker — keyed by sceneId so multiple Scenes can
+  // be open at once without their pickers stomping each other.
+  let addSourcePickerOpenForScene = $state<string | null>(null);
+
+  const ALL_SOURCE_ROLES: SourceRole[] = [
+    'screen',
+    'window',
+    'camera',
+    'microphone',
+    'systemAudio'
+  ];
+
+  function sourceRoleLabel(r: SourceRole): string {
+    switch (r) {
+      case 'screen':
+        return 'Screen';
+      case 'window':
+        return 'Window';
+      case 'camera':
+        return 'Camera';
+      case 'microphone':
+        return 'Microphone';
+      case 'systemAudio':
+        return 'System Audio';
+    }
+  }
+
+  async function loadScenes() {
+    if (!folder) return;
+    try {
+      scenes = await listScenes(folder);
+      scenesLoaded = true;
+    } catch (e) {
+      error = formatError(e);
+    }
+  }
+
+  async function openScenesView() {
+    view = 'scenes';
+    if (!scenesLoaded) await loadScenes();
+  }
+
+  async function submitNewScene() {
+    const name = newSceneName.trim();
+    if (!name || !folder) return;
+    busy = true;
+    try {
+      const s = await createScene(folder, name);
+      scenes = [...scenes, s];
+      newSceneName = '';
+    } catch (e) {
+      error = formatError(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  function startEditScene(s: Scene) {
+    editingSceneId = s.id;
+    editingSceneDraft = s.name;
+  }
+  function cancelEditScene() {
+    editingSceneId = null;
+    editingSceneDraft = '';
+  }
+  async function commitEditScene() {
+    const id = editingSceneId;
+    const name = editingSceneDraft.trim();
+    editingSceneId = null;
+    editingSceneDraft = '';
+    if (!id || !folder || !name) return;
+    busy = true;
+    try {
+      await renameScene(folder, id, name);
+      scenes = scenes.map((s) => (s.id === id ? { ...s, name } : s));
+    } catch (e) {
+      error = formatError(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function dupScene(s: Scene) {
+    if (!folder) return;
+    busy = true;
+    try {
+      const dup = await duplicateScene(folder, s.id);
+      const i = scenes.findIndex((x) => x.id === s.id);
+      scenes = [...scenes.slice(0, i + 1), dup, ...scenes.slice(i + 1)];
+    } catch (e) {
+      error = formatError(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function dropScene(s: Scene) {
+    if (!folder) return;
+    if (!confirm(`Delete Scene "${s.name}"?`)) return;
+    busy = true;
+    try {
+      await deleteScene(folder, s.id);
+      scenes = scenes.filter((x) => x.id !== s.id);
+    } catch (e) {
+      error = formatError(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function addSourceTo(s: Scene, role: SourceRole) {
+    if (!folder) return;
+    busy = true;
+    try {
+      const added = await addSceneSource(folder, s.id, role);
+      scenes = scenes.map((x) =>
+        x.id === s.id ? { ...x, sources: [...x.sources, added] } : x
+      );
+      addSourcePickerOpenForScene = null;
+    } catch (e) {
+      error = formatError(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  // Per-role device list cache. Each role's list is loaded lazily on first
+  // dropdown render and re-queried on Refresh. Live OS state changes (a
+  // USB camera plugged in / out) only get picked up on Refresh.
+  let deviceListsByRole = $state<Partial<Record<SourceRole, Device[]>>>({});
+  let deviceListLoading = $state<Partial<Record<SourceRole, boolean>>>({});
+
+  async function ensureDeviceList(role: SourceRole, force = false) {
+    if (!force && deviceListsByRole[role] !== undefined) return;
+    deviceListLoading[role] = true;
+    try {
+      const list = await listCaptureDevices(role);
+      deviceListsByRole[role] = list;
+    } catch (e) {
+      // Don't bubble up — the dropdown will just show only the Default
+      // entry, with no real-device options. The error log helps debug.
+      console.warn('listCaptureDevices', role, e);
+      deviceListsByRole[role] = [];
+    } finally {
+      deviceListLoading[role] = false;
+    }
+  }
+
+  async function refreshDeviceList(role: SourceRole) {
+    await ensureDeviceList(role, true);
+  }
+
+  // Dropdown options for a SceneSource: Default sentinel + the live list
+  // + (if the row's currently-bound device isn't in the live list) the
+  // stale entry flagged "(missing)".
+  function dropdownOptions(
+    role: SourceRole,
+    bound: Device
+  ): { device: Device; missing: boolean }[] {
+    const live = deviceListsByRole[role] ?? [];
+    const opts: { device: Device; missing: boolean }[] = [
+      { device: DEFAULT_DEVICE, missing: false }
+    ];
+    for (const d of live) {
+      if (d.id === DEFAULT_DEVICE.id) continue;
+      opts.push({ device: d, missing: false });
+    }
+    const knownIds = new Set(opts.map((o) => o.device.id));
+    if (!knownIds.has(bound.id)) {
+      opts.push({ device: bound, missing: true });
+    }
+    return opts;
+  }
+
+  async function pickDeviceForSource(
+    s: Scene,
+    sourceIndex: number,
+    deviceJson: string
+  ) {
+    if (!folder) return;
+    const device: Device = JSON.parse(deviceJson);
+    busy = true;
+    try {
+      const updated = await setSceneSourceDevice(folder, s.id, sourceIndex, device);
+      scenes = scenes.map((x) =>
+        x.id === s.id
+          ? {
+              ...x,
+              sources: x.sources.map((src, i) =>
+                i === sourceIndex ? updated : src
+              )
+            }
+          : x
+      );
+    } catch (e) {
+      error = formatError(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  // --- Scene Editor canvas + inspector (issue #39) -------------------
+
+  /// Which Scene's canvas is currently expanded. Closed by default so
+  /// the Scenes list stays compact for users with many Scenes.
+  let openCanvasForScene = $state<string | null>(null);
+
+  /// Pending debounce for setSceneSourceDefaults — one timeout per
+  /// `<sceneId>:<sourceIndex>` so each row writes at its own rate.
+  let defaultsTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /// Optimistic local edits not yet flushed to disk. Keyed the same way
+  /// so render reads from this when it exists, falling back to scenes[].
+  let pendingDefaults = $state<Record<string, CompositionDefaults>>({});
+
+  function defaultsKey(sceneId: string, sourceIndex: number): string {
+    return `${sceneId}:${sourceIndex}`;
+  }
+
+  function currentDefaults(s: Scene, i: number): CompositionDefaults {
+    return pendingDefaults[defaultsKey(s.id, i)] ?? s.sources[i].defaults;
+  }
+
+  function scheduleDefaultsWrite(s: Scene, i: number, next: CompositionDefaults) {
+    const key = defaultsKey(s.id, i);
+    pendingDefaults = { ...pendingDefaults, [key]: next };
+    const existing = defaultsTimers.get(key);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(async () => {
+      defaultsTimers.delete(key);
+      if (!folder) return;
+      try {
+        const updated = await setSceneSourceDefaults(folder, s.id, i, next);
+        scenes = scenes.map((x) =>
+          x.id === s.id
+            ? {
+                ...x,
+                sources: x.sources.map((src, idx) => (idx === i ? updated : src))
+              }
+            : x
+        );
+        // Drop the optimistic entry now the canonical value is on disk.
+        const copy = { ...pendingDefaults };
+        delete copy[key];
+        pendingDefaults = copy;
+      } catch (e) {
+        error = formatError(e);
+      }
+    }, 250);
+    defaultsTimers.set(key, timer);
+  }
+
+  function flipMuted(s: Scene, i: number) {
+    const cur = currentDefaults(s, i);
+    const next: CompositionDefaults = {
+      ...cur,
+      audioGainDb: cur.audioGainDb === Number.NEGATIVE_INFINITY ? 0 : Number.NEGATIVE_INFINITY
+    };
+    scheduleDefaultsWrite(s, i, next);
+  }
+
+  function clamp(v: number, lo: number, hi: number): number {
+    return Math.max(lo, Math.min(hi, v));
+  }
+
+  function isAudioOnly(role: SourceRole): boolean {
+    return role === 'microphone' || role === 'systemAudio';
+  }
+
+  // Drag state for the canvas. Tracked per dragging operation so we can
+  // restore on Escape.
+  let dragState = $state<{
+    sceneId: string;
+    sourceIndex: number;
+    mode: 'move' | 'resize';
+    startX: number;
+    startY: number;
+    startDefaults: CompositionDefaults;
+    canvasWidth: number;
+    canvasHeight: number;
+  } | null>(null);
+
+  function startBoxDrag(
+    e: PointerEvent,
+    s: Scene,
+    i: number,
+    mode: 'move' | 'resize'
+  ) {
+    e.preventDefault();
+    const canvas = (e.currentTarget as HTMLElement).closest('.scene-canvas') as HTMLElement | null;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    dragState = {
+      sceneId: s.id,
+      sourceIndex: i,
+      mode,
+      startX: e.clientX,
+      startY: e.clientY,
+      startDefaults: { ...currentDefaults(s, i) },
+      canvasWidth: rect.width,
+      canvasHeight: rect.height
+    };
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  }
+
+  function onBoxDragMove(e: PointerEvent) {
+    if (!dragState) return;
+    const dx = (e.clientX - dragState.startX) / dragState.canvasWidth;
+    const dy = (e.clientY - dragState.startY) / dragState.canvasHeight;
+    const s = scenes.find((x) => x.id === dragState!.sceneId);
+    if (!s) return;
+    const start = dragState.startDefaults;
+    if (dragState.mode === 'move') {
+      const next: CompositionDefaults = {
+        ...start,
+        position: {
+          x: clamp(start.position.x + dx, 0, 1),
+          y: clamp(start.position.y + dy, 0, 1)
+        }
+      };
+      scheduleDefaultsWrite(s, dragState.sourceIndex, next);
+    } else {
+      // Resize: scale tracks horizontal delta (1.0 = fills canvas).
+      const next: CompositionDefaults = {
+        ...start,
+        scale: clamp(start.scale + dx, 0.05, 2)
+      };
+      scheduleDefaultsWrite(s, dragState.sourceIndex, next);
+    }
+  }
+
+  function endBoxDrag(e: PointerEvent) {
+    if (!dragState) return;
+    (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
+    dragState = null;
+  }
+
+  async function pickTranscriptSource(s: Scene, sourceIndex: number) {
+    if (!folder) return;
+    busy = true;
+    try {
+      const updated = await setSceneTranscriptSource(folder, s.id, sourceIndex);
+      scenes = scenes.map((x) =>
+        x.id === s.id
+          ? {
+              ...x,
+              sources: x.sources.map((src, i) => ({
+                ...src,
+                isTranscriptSource: i === sourceIndex
+              }))
+            }
+          : x
+      );
+      // Keep the type-checker happy about the unused return.
+      void updated;
+    } catch (e) {
+      error = formatError(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function moveSourceRow(s: Scene, fromIndex: number, delta: number) {
+    if (!folder) return;
+    const toIndex = clamp(fromIndex + delta, 0, s.sources.length - 1);
+    if (toIndex === fromIndex) return;
+    busy = true;
+    try {
+      await reorderSceneSource(folder, s.id, fromIndex, toIndex);
+      scenes = scenes.map((x) => {
+        if (x.id !== s.id) return x;
+        const rows = [...x.sources];
+        const [row] = rows.splice(fromIndex, 1);
+        rows.splice(toIndex, 0, row);
+        return { ...x, sources: rows };
+      });
+    } catch (e) {
+      error = formatError(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function removeSourceAt(s: Scene, index: number) {
+    if (!folder) return;
+    busy = true;
+    try {
+      await removeSceneSource(folder, s.id, index);
+      scenes = scenes.map((x) =>
+        x.id === s.id
+          ? { ...x, sources: x.sources.filter((_, i) => i !== index) }
+          : x
+      );
+    } catch (e) {
+      error = formatError(e);
+    } finally {
+      busy = false;
+    }
+  }
 
   // Workflow state editor (modal-ish inline panel).
   let editingStates = $state(false);
@@ -412,6 +840,9 @@
   let sessionsByVideo = $state<Record<string, SessionSnapshot>>({});
   let segmentsByVideo = $state<Record<string, Segment[]>>({});
   let orphans = $state<OrphanSegment[]>([]);
+  /// Issue #38 — per-Take grouping of crashed partials. Each row is one
+  /// Take; Import / Discard act on every Segment in it at once.
+  let orphanTakes = $state<OrphanTake[]>([]);
   let recordingSources = $state<CaptureSources>({
     microphone: true,
     systemAudio: false,
@@ -475,10 +906,43 @@
   async function refreshOrphans() {
     if (!folder) return;
     try {
-      orphans = await scanOrphanSegments(folder);
+      // Prefer the per-Take grouped view; fall back to the per-Segment
+      // shape only if the new command fails (e.g. a v1 backend that
+      // doesn't have it). The per-Segment list also still drives the
+      // single-Segment fallback path for v1 .partial.mkv orphans.
+      const [perTake, perSegment] = await Promise.all([
+        scanOrphanTakes(folder).catch(() => []),
+        scanOrphanSegments(folder).catch(() => [])
+      ]);
+      orphanTakes = perTake;
+      orphans = perSegment;
     } catch (e) {
       console.warn('scanOrphans failed', e);
     }
+  }
+
+  async function importOrphanTakeRow(t: OrphanTake) {
+    if (!folder) return;
+    await withBusy(async () => {
+      await importOrphanTake(folder!, t.videoId, t.takeId);
+      await Promise.all([refreshOrphans(), refreshSegments(t.videoId)]);
+    });
+  }
+
+  async function dropOrphanTakeRow(t: OrphanTake) {
+    if (!folder) return;
+    if (
+      !confirm(
+        `Discard this recovered Take (${t.segments.length} source${
+          t.segments.length === 1 ? '' : 's'
+        })? The files will be deleted.`
+      )
+    )
+      return;
+    await withBusy(async () => {
+      await discardOrphanTake(folder!, t.videoId, t.takeId);
+      await refreshOrphans();
+    });
   }
 
   async function refreshPermissions() {
@@ -489,6 +953,27 @@
     }
   }
 
+  // Scene picker state (issue #35). When `scenePickerOpenForVideo` is set,
+  // the modal is open targeting that Video. `pinAsDefault` records whether
+  // the user wants the picked Scene saved as the Video's pinned default.
+  let scenePickerOpenForVideo = $state<string | null>(null);
+  let scenePickerPinAsDefault = $state(true);
+
+  function pinnedSceneFor(videoId: string): Scene | undefined {
+    const v = videoById(videoId);
+    if (!v?.defaultSceneId) return undefined;
+    return scenes.find((s) => s.id === v.defaultSceneId);
+  }
+
+  async function ensureScenesLoaded() {
+    if (!scenesLoaded) await loadScenes();
+  }
+
+  /// "Record" button entry point. Decision tree:
+  ///   1. Video has a pinned Scene that still exists → record with it.
+  ///   2. At least one Scene exists → open the Scene picker.
+  ///   3. No Scenes at all → fall back to the legacy boolean-trio synthetic
+  ///      Screen+Mic request list so v1 Course Folders still record.
   async function startRecordingForVideo(videoId: string) {
     if (!folder) return;
     await refreshPermissions();
@@ -497,12 +982,74 @@
       return;
     }
     permsBlockingVideoId = null;
+    await ensureScenesLoaded();
+
+    const pinned = pinnedSceneFor(videoId);
+    if (pinned) {
+      await startWithScene(videoId, pinned.id, false);
+      return;
+    }
+    if (scenes.length > 0) {
+      scenePickerOpenForVideo = videoId;
+      scenePickerPinAsDefault = true;
+      return;
+    }
+    // Legacy fallback — no Scenes in the Course at all.
     await withBusy(async () => {
       const requests = captureRequestsFromSources(recordingSources);
       const snap = await startRecording(folder!, videoId, requests);
       sessionsByVideo = { ...sessionsByVideo, [videoId]: snap };
       sessionStartedAt = { ...sessionStartedAt, [snap.id]: Date.now() };
     });
+  }
+
+  /// "Record with…" — always opens the picker, even when a Scene is pinned.
+  async function recordWithSceneFor(videoId: string) {
+    if (!folder) return;
+    await refreshPermissions();
+    if (!permissionsSatisfied(permissions, recordingSources)) {
+      permsBlockingVideoId = videoId;
+      return;
+    }
+    permsBlockingVideoId = null;
+    await ensureScenesLoaded();
+    if (scenes.length === 0) {
+      error = 'No Scenes yet — create one in the Scenes view first.';
+      return;
+    }
+    scenePickerOpenForVideo = videoId;
+    scenePickerPinAsDefault = false;
+  }
+
+  async function startWithScene(
+    videoId: string,
+    sceneId: string,
+    pinAsDefault: boolean
+  ) {
+    if (!folder) return;
+    await withBusy(async () => {
+      if (pinAsDefault) {
+        try {
+          await pinDefaultScene(folder!, videoId, sceneId);
+          if (course) {
+            course = {
+              ...course,
+              videos: course.videos.map((v) =>
+                v.id === videoId ? { ...v, defaultSceneId: sceneId } : v
+              )
+            };
+          }
+        } catch (e) {
+          // Non-fatal — pinning is a convenience, not the goal of the
+          // click. Carry on and start the recording anyway.
+          console.warn('pinDefaultScene', e);
+        }
+      }
+      const snap = await startRecordingWithScene(folder!, videoId, sceneId);
+      sessionsByVideo = { ...sessionsByVideo, [videoId]: snap };
+      sessionStartedAt = { ...sessionStartedAt, [snap.id]: Date.now() };
+    });
+    scenePickerOpenForVideo = null;
   }
 
   async function pauseFor(videoId: string) {
@@ -1073,27 +1620,36 @@
     <div class="error" role="alert">{error}</div>
   {/if}
 
-  {#if orphans.length > 0}
-    <section class="orphan-banner" aria-label="Recovered recordings">
-      <h2>Recovered recording{orphans.length === 1 ? '' : 's'}</h2>
+  {#if orphanTakes.length > 0}
+    <section class="orphan-banner" aria-label="Recovered Takes">
+      <h2>Recovered Take{orphanTakes.length === 1 ? '' : 's'}</h2>
       <p class="hint">
-        {orphans.length === 1
+        {orphanTakes.length === 1
           ? 'A previous recording session was interrupted.'
-          : `${orphans.length} previous recording sessions were interrupted.`}
-        The captured file{orphans.length === 1 ? '' : 's'} may still be usable.
+          : `${orphanTakes.length} previous recording sessions were interrupted.`}
+        Import to keep every source in the Take, or Discard to delete the files.
       </p>
       <ul class="orphan-list">
-        {#each orphans as o (`${o.videoId}:${o.id}`)}
+        {#each orphanTakes as t (`${t.videoId}:${t.takeId}`)}
           <li>
             <div class="orphan-meta">
-              <strong>{videoTitleForOrphan(o)}</strong>
-              <code title={o.path}>{o.path}</code>
+              <strong>{videoTitleForOrphan({ videoId: t.videoId, id: t.takeId, path: '' } as OrphanSegment)}</strong>
+              <span class="orphan-chips">
+                {#each t.segments as s (s.segmentId)}
+                  <span class="chip">
+                    <span class="chip-role">{sourceRoleLabel(s.sourceRole)}</span>
+                  </span>
+                {/each}
+              </span>
+              {#if t.recordedAt}
+                <code title={t.recordedAt}>{t.recordedAt}</code>
+              {/if}
             </div>
             <div class="actions">
-              <button class="primary" disabled={busy} onclick={() => importOrphan(o)}>
-                Import
+              <button class="primary" disabled={busy} onclick={() => importOrphanTakeRow(t)}>
+                Import {t.segments.length === 1 ? 'Take' : `Take (${t.segments.length} sources)`}
               </button>
-              <button class="ghost" disabled={busy} onclick={() => dropOrphan(o)}>
+              <button class="ghost" disabled={busy} onclick={() => dropOrphanTakeRow(t)}>
                 Discard
               </button>
             </div>
@@ -1176,6 +1732,12 @@
           class:active={view === 'board'}
           onclick={() => (view = 'board')}
         >Board</button>
+        <button
+          role="tab"
+          aria-selected={view === 'scenes'}
+          class:active={view === 'scenes'}
+          onclick={openScenesView}
+        >Scenes</button>
       </div>
       <button class="ghost" onclick={openStateEditor} disabled={busy}>Edit States…</button>
     </section>
@@ -1361,10 +1923,20 @@
                           disabled={busy || segs.length > 0}
                           title={segs.length > 0
                             ? 'This Video already has a Segment — multi-Segment Videos arrive in a later slice.'
-                            : 'Start recording for this Video'}
+                            : v.defaultSceneId
+                              ? 'Record using this Video’s pinned Scene'
+                              : 'Start recording for this Video'}
                           onclick={() => startRecordingForVideo(v.id)}
                         >
                           ● Record
+                        </button>
+                        <button
+                          class="link"
+                          disabled={busy || segs.length > 0}
+                          title="Pick a Scene for this take only"
+                          onclick={() => recordWithSceneFor(v.id)}
+                        >
+                          Record with…
                         </button>
                       {/if}
                       {#if segs.length > 0}
@@ -1640,7 +2212,7 @@
         {/each}
       </ol>
     {/if}
-    {:else}
+    {:else if view === 'board'}
       <!-- Board view: one column per workflow state, draggable Video cards. -->
       <section class="board" aria-label="Workflow board">
         {#each course.workflowStates as s (s.id)}
@@ -1680,6 +2252,379 @@
           </div>
         {/each}
       </section>
+    {:else if view === 'scenes'}
+      <section class="scenes" aria-label="Scenes">
+        <form
+          class="new-form"
+          onsubmit={(e) => {
+            e.preventDefault();
+            void submitNewScene();
+          }}
+        >
+          <input
+            bind:value={newSceneName}
+            placeholder="Scene name (e.g. Talking Head)"
+          />
+          <button class="primary" type="submit" disabled={busy || !newSceneName.trim()}>
+            + Add Scene
+          </button>
+        </form>
+
+        {#if scenes.length === 0 && scenesLoaded}
+          <p class="empty">
+            No Scenes yet. A Scene is a named, reusable Capture preset — a list of
+            Source Roles (screen, camera, microphone, …) bound to specific devices.
+            Phase 2 slice 1 only handles the data; the device picker lands in
+            slice 2.
+          </p>
+        {/if}
+
+        <ol class="scenes-list">
+          {#each scenes as s (s.id)}
+            <li class="scene-row">
+              <header class="scene-header">
+                {#if editingSceneId === s.id}
+                  <input
+                    bind:value={editingSceneDraft}
+                    onblur={commitEditScene}
+                    onkeydown={(e) => {
+                      if (e.key === 'Enter') void commitEditScene();
+                      else if (e.key === 'Escape') cancelEditScene();
+                    }}
+                  />
+                {:else}
+                  <button class="title-btn" onclick={() => startEditScene(s)}>
+                    {s.name}
+                  </button>
+                {/if}
+                <div class="actions">
+                  <button
+                    class="ghost"
+                    disabled={busy}
+                    onclick={() =>
+                      (openCanvasForScene = openCanvasForScene === s.id ? null : s.id)}
+                  >
+                    {openCanvasForScene === s.id ? 'Hide Canvas' : 'Open Canvas'}
+                  </button>
+                  <button class="ghost" disabled={busy} onclick={() => dupScene(s)}>
+                    Duplicate
+                  </button>
+                  <button class="ghost" disabled={busy} onclick={() => dropScene(s)}>
+                    Delete
+                  </button>
+                </div>
+              </header>
+
+              {#if openCanvasForScene === s.id}
+                <div class="scene-editor">
+                  <div
+                    class="scene-canvas"
+                    aria-label="Scene canvas preview (1920×1080)"
+                  >
+                    {#each s.sources as src, i (i)}
+                      {@const d = currentDefaults(s, i)}
+                      {#if !isAudioOnly(src.role)}
+                        <div
+                          class="canvas-box"
+                          style="
+                            left: {d.position.x * 100}%;
+                            top: {d.position.y * 100}%;
+                            width: {d.scale * 100}%;
+                            height: {d.scale * 100 * (9 / 16)}%;
+                            opacity: {d.opacity};
+                            z-index: {i + 1};
+                          "
+                          aria-label="{sourceRoleLabel(src.role)} canvas box"
+                        >
+                          <div
+                            class="box-body"
+                            role="button"
+                            tabindex="0"
+                            onpointerdown={(e) => startBoxDrag(e, s, i, 'move')}
+                            onpointermove={onBoxDragMove}
+                            onpointerup={endBoxDrag}
+                            onpointercancel={endBoxDrag}
+                          >
+                            <span class="box-label">
+                              {sourceRoleLabel(src.role)} — {src.device.label}
+                            </span>
+                          </div>
+                          <div
+                            class="box-resize"
+                            role="button"
+                            tabindex="0"
+                            aria-label="Resize"
+                            onpointerdown={(e) => startBoxDrag(e, s, i, 'resize')}
+                            onpointermove={onBoxDragMove}
+                            onpointerup={endBoxDrag}
+                            onpointercancel={endBoxDrag}
+                          ></div>
+                        </div>
+                      {/if}
+                    {/each}
+                  </div>
+
+                  <div class="audio-chips" aria-label="Audio-only sources">
+                    {#each s.sources as src, i (i)}
+                      {#if isAudioOnly(src.role)}
+                        {@const d = currentDefaults(s, i)}
+                        <div class="audio-chip">
+                          <span class="chip-role">{sourceRoleLabel(src.role)}</span>
+                          <span class="chip-device">{src.device.label}</span>
+                          <label class="audio-gain">
+                            Gain
+                            <input
+                              type="range"
+                              min="-60"
+                              max="12"
+                              step="0.5"
+                              disabled={d.audioGainDb === Number.NEGATIVE_INFINITY}
+                              value={d.audioGainDb === Number.NEGATIVE_INFINITY ? -60 : d.audioGainDb}
+                              oninput={(e) => {
+                                const v = parseFloat((e.target as HTMLInputElement).value);
+                                scheduleDefaultsWrite(s, i, { ...d, audioGainDb: v });
+                              }}
+                            />
+                            <span class="gain-value">
+                              {d.audioGainDb === Number.NEGATIVE_INFINITY ? 'muted' : `${d.audioGainDb.toFixed(1)} dB`}
+                            </span>
+                          </label>
+                          <button class="ghost mute" onclick={() => flipMuted(s, i)}>
+                            {d.audioGainDb === Number.NEGATIVE_INFINITY ? 'Unmute' : 'Mute'}
+                          </button>
+                          <label
+                            class="transcript-source"
+                            title="The Take's Transcript Source — only this source's audio will be transcribed (Phase 6)."
+                          >
+                            <input
+                              type="radio"
+                              name="transcript-source-{s.id}"
+                              checked={!!src.isTranscriptSource}
+                              disabled={busy}
+                              onchange={() => pickTranscriptSource(s, i)}
+                            />
+                            Transcript
+                          </label>
+                        </div>
+                      {/if}
+                    {/each}
+                  </div>
+
+                  <div class="inspector" aria-label="Source inspector">
+                    {#each s.sources as src, i (i)}
+                      {@const d = currentDefaults(s, i)}
+                      <div class="inspector-row">
+                        <header>
+                          <span class="chip-role">{sourceRoleLabel(src.role)}</span>
+                          <span class="chip-device">{src.device.label}</span>
+                          <span class="z-actions">
+                            <button
+                              class="ghost"
+                              disabled={busy || i === 0}
+                              onclick={() => moveSourceRow(s, i, -1)}
+                              aria-label="Move up (z-order)"
+                              title="Move up"
+                            >↑</button>
+                            <button
+                              class="ghost"
+                              disabled={busy || i === s.sources.length - 1}
+                              onclick={() => moveSourceRow(s, i, 1)}
+                              aria-label="Move down (z-order)"
+                              title="Move down"
+                            >↓</button>
+                          </span>
+                        </header>
+                        {#if !isAudioOnly(src.role)}
+                          <div class="inspector-grid">
+                            <label>
+                              Position X
+                              <input
+                                type="number"
+                                step="0.01"
+                                min="0"
+                                max="1"
+                                value={d.position.x.toFixed(3)}
+                                oninput={(e) => {
+                                  const v = parseFloat((e.target as HTMLInputElement).value);
+                                  if (Number.isFinite(v))
+                                    scheduleDefaultsWrite(s, i, {
+                                      ...d,
+                                      position: { ...d.position, x: clamp(v, 0, 1) }
+                                    });
+                                }}
+                              />
+                            </label>
+                            <label>
+                              Position Y
+                              <input
+                                type="number"
+                                step="0.01"
+                                min="0"
+                                max="1"
+                                value={d.position.y.toFixed(3)}
+                                oninput={(e) => {
+                                  const v = parseFloat((e.target as HTMLInputElement).value);
+                                  if (Number.isFinite(v))
+                                    scheduleDefaultsWrite(s, i, {
+                                      ...d,
+                                      position: { ...d.position, y: clamp(v, 0, 1) }
+                                    });
+                                }}
+                              />
+                            </label>
+                            <label>
+                              Scale
+                              <input
+                                type="number"
+                                step="0.05"
+                                min="0.05"
+                                max="2"
+                                value={d.scale.toFixed(2)}
+                                oninput={(e) => {
+                                  const v = parseFloat((e.target as HTMLInputElement).value);
+                                  if (Number.isFinite(v))
+                                    scheduleDefaultsWrite(s, i, { ...d, scale: clamp(v, 0.05, 2) });
+                                }}
+                              />
+                            </label>
+                            <label>
+                              Opacity
+                              <input
+                                type="range"
+                                min="0"
+                                max="1"
+                                step="0.01"
+                                value={d.opacity}
+                                oninput={(e) => {
+                                  const v = parseFloat((e.target as HTMLInputElement).value);
+                                  scheduleDefaultsWrite(s, i, { ...d, opacity: clamp(v, 0, 1) });
+                                }}
+                              />
+                              <span class="opacity-value">{(d.opacity * 100).toFixed(0)}%</span>
+                            </label>
+                          </div>
+                        {/if}
+                      </div>
+                    {/each}
+                  </div>
+                </div>
+              {/if}
+
+              <ul class="source-rows" aria-label="Source roles for {s.name}">
+                {#each s.sources as src, i (i)}
+                  {@const opts = dropdownOptions(src.role, src.device)}
+                  {@const loading = deviceListLoading[src.role] === true}
+                  <li
+                    class="source-row"
+                    onpointerenter={() => void ensureDeviceList(src.role)}
+                  >
+                    <span class="chip-role">{sourceRoleLabel(src.role)}</span>
+                    <select
+                      class="device-select"
+                      class:missing={opts.find((o) => o.device.id === src.device.id)?.missing}
+                      disabled={busy}
+                      value={JSON.stringify(src.device)}
+                      onchange={(e) =>
+                        pickDeviceForSource(s, i, (e.currentTarget as HTMLSelectElement).value)}
+                    >
+                      {#each opts as opt (opt.device.id)}
+                        <option value={JSON.stringify(opt.device)}>
+                          {opt.device.label}{opt.missing ? ' (missing)' : ''}
+                        </option>
+                      {/each}
+                    </select>
+                    <button
+                      class="ghost refresh"
+                      aria-label="Refresh device list"
+                      disabled={busy || loading}
+                      onclick={() => refreshDeviceList(src.role)}
+                      title="Refresh device list"
+                    >{loading ? '…' : '↻'}</button>
+                    <button
+                      class="chip-remove"
+                      aria-label="Remove source"
+                      disabled={busy}
+                      onclick={() => removeSourceAt(s, i)}
+                    >×</button>
+                  </li>
+                {/each}
+                {#if s.sources.length === 0}
+                  <li class="source-empty">No sources yet — click "Add Source" below.</li>
+                {/if}
+              </ul>
+
+              {#if addSourcePickerOpenForScene === s.id}
+                <div class="source-picker">
+                  {#each ALL_SOURCE_ROLES as role (role)}
+                    <button
+                      class="ghost"
+                      disabled={busy}
+                      onclick={() => addSourceTo(s, role)}
+                    >+ {sourceRoleLabel(role)}</button>
+                  {/each}
+                  <button
+                    class="ghost"
+                    onclick={() => (addSourcePickerOpenForScene = null)}
+                  >Cancel</button>
+                </div>
+              {:else}
+                <button
+                  class="ghost add-source"
+                  disabled={busy}
+                  onclick={() => (addSourcePickerOpenForScene = s.id)}
+                >+ Add Source</button>
+              {/if}
+            </li>
+          {/each}
+        </ol>
+      </section>
+    {/if}
+
+    {#if scenePickerOpenForVideo}
+      {@const targetId = scenePickerOpenForVideo}
+      <div class="scene-picker-backdrop" role="dialog" aria-modal="true">
+        <div class="scene-picker">
+          <header>
+            <h2>Choose a Scene</h2>
+            <button
+              class="ghost"
+              onclick={() => (scenePickerOpenForVideo = null)}
+              disabled={busy}
+            >Cancel</button>
+          </header>
+          <p class="hint">
+            Pick the Scene to record with. The Take will use that Scene's
+            source list and bound devices.
+          </p>
+          <ul class="picker-list">
+            {#each scenes as s (s.id)}
+              <li>
+                <button
+                  class="picker-row"
+                  disabled={busy}
+                  onclick={() => startWithScene(targetId, s.id, scenePickerPinAsDefault)}
+                >
+                  <span class="picker-name">{s.name}</span>
+                  <span class="picker-chips">
+                    {#each s.sources as src, i (i)}
+                      <span class="chip">
+                        <span class="chip-role">{sourceRoleLabel(src.role)}</span>
+                      </span>
+                    {/each}
+                    {#if s.sources.length === 0}
+                      <span class="chip-empty">(empty Scene)</span>
+                    {/if}
+                  </span>
+                </button>
+              </li>
+            {/each}
+          </ul>
+          <label class="picker-pin">
+            <input type="checkbox" bind:checked={scenePickerPinAsDefault} />
+            Pin as this Video's default Scene
+          </label>
+        </div>
+      </div>
     {/if}
   {/if}
 </main>
@@ -2313,5 +3258,362 @@
   li.video-panel:focus-visible {
     outline: 2px solid #99baff;
     outline-offset: -2px;
+  }
+
+  /* Scenes view (Phase 2 slice 1 — issue #33). */
+  .scenes {
+    padding: 0 1rem 2rem;
+  }
+  .scenes .new-form {
+    display: flex;
+    gap: 0.5rem;
+    margin: 1rem 0;
+  }
+  .scenes .new-form input {
+    flex: 1;
+    max-width: 24rem;
+    padding: 0.4rem 0.6rem;
+    font-size: 0.95rem;
+  }
+  .scenes .empty {
+    color: #666;
+    max-width: 40rem;
+  }
+  .scenes-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+  .scene-row {
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 0.75rem;
+    background: #fafafa;
+  }
+  .scene-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+  }
+  .scene-header .title-btn {
+    flex: 1;
+    background: none;
+    border: none;
+    text-align: left;
+    font-weight: 600;
+    font-size: 1rem;
+    cursor: pointer;
+    padding: 0.1rem 0.2rem;
+  }
+  .scene-header .title-btn:hover {
+    background: #eef2ff;
+    border-radius: 3px;
+  }
+  .scene-header input {
+    flex: 1;
+    padding: 0.25rem 0.4rem;
+    font-size: 1rem;
+    font-weight: 600;
+  }
+  .scene-header .actions {
+    display: flex;
+    gap: 0.25rem;
+  }
+  .source-chips {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 0.5rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+  .source-rows {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+  .source-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    padding: 0.25rem 0.6rem;
+  }
+  .source-row .chip-role {
+    min-width: 7rem;
+  }
+  .source-row .device-select {
+    flex: 1;
+    max-width: 22rem;
+    padding: 0.2rem 0.4rem;
+  }
+  .source-row .device-select.missing {
+    border-color: #c00;
+    color: #c00;
+  }
+  .source-row .refresh {
+    padding: 0.1rem 0.4rem;
+    font-size: 1rem;
+  }
+  .source-empty {
+    color: #888;
+    font-style: italic;
+    background: none;
+    border: 1px dashed #ddd;
+    padding: 0.4rem 0.6rem;
+    border-radius: 4px;
+  }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 999px;
+    padding: 0.15rem 0.5rem;
+    font-size: 0.85rem;
+  }
+  .chip-role {
+    font-weight: 600;
+  }
+  .chip-device {
+    color: #666;
+  }
+  .chip-remove {
+    background: none;
+    border: none;
+    color: #888;
+    cursor: pointer;
+    font-size: 1rem;
+    padding: 0 0.1rem;
+    line-height: 1;
+  }
+  .chip-remove:hover {
+    color: #c00;
+  }
+  .source-picker {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+  .add-source {
+    font-size: 0.85rem;
+  }
+
+  /* Scene picker modal (issue #35). */
+  .scene-picker-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.32);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+  }
+  .scene-picker {
+    background: #fff;
+    border-radius: 8px;
+    box-shadow: 0 12px 48px rgba(0, 0, 0, 0.2);
+    padding: 1.25rem;
+    width: min(36rem, calc(100% - 2rem));
+    max-height: 80vh;
+    overflow: auto;
+  }
+  .scene-picker header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.25rem;
+  }
+  .scene-picker header h2 {
+    margin: 0;
+    font-size: 1.1rem;
+  }
+  .scene-picker .hint {
+    color: #666;
+    margin: 0 0 0.75rem;
+    font-size: 0.9rem;
+  }
+  .picker-list {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+  .picker-row {
+    width: 100%;
+    text-align: left;
+    background: #fafafa;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 0.6rem 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    cursor: pointer;
+  }
+  .picker-row:hover {
+    background: #f0f5ff;
+    border-color: #99baff;
+  }
+  .picker-name {
+    font-weight: 600;
+  }
+  .picker-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem;
+  }
+  .chip-empty {
+    color: #999;
+    font-style: italic;
+  }
+  .picker-pin {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.9rem;
+    color: #444;
+  }
+
+  /* Scene editor canvas + inspector (issue #39). */
+  .scene-editor {
+    margin-top: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+  .scene-canvas {
+    position: relative;
+    aspect-ratio: 16 / 9;
+    width: 100%;
+    background: linear-gradient(135deg, #1d1f25, #2a2f3a);
+    border: 1px solid #444;
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .canvas-box {
+    position: absolute;
+    border: 1px solid #99baff;
+    background: rgba(63, 122, 224, 0.18);
+    box-sizing: border-box;
+    min-width: 30px;
+    min-height: 18px;
+  }
+  .canvas-box .box-body {
+    width: 100%;
+    height: 100%;
+    cursor: move;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.25rem;
+  }
+  .canvas-box .box-label {
+    color: #fff;
+    font-size: 0.75rem;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+    text-align: center;
+    pointer-events: none;
+  }
+  .canvas-box .box-resize {
+    position: absolute;
+    right: -6px;
+    bottom: -6px;
+    width: 14px;
+    height: 14px;
+    background: #99baff;
+    border: 1px solid #fff;
+    border-radius: 2px;
+    cursor: nwse-resize;
+  }
+  .audio-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+  .audio-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    padding: 0.35rem 0.6rem;
+    font-size: 0.85rem;
+  }
+  .audio-chip .audio-gain {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .audio-chip .gain-value {
+    font-variant-numeric: tabular-nums;
+    min-width: 4.5rem;
+    text-align: right;
+  }
+  .audio-chip .mute {
+    font-size: 0.8rem;
+  }
+  .audio-chip .transcript-source {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.8rem;
+    color: #335;
+  }
+  .inspector {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .inspector-row {
+    border: 1px solid #e0e0e0;
+    border-radius: 6px;
+    padding: 0.5rem;
+    background: #fff;
+  }
+  .inspector-row header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.4rem;
+  }
+  .inspector-row header .z-actions {
+    margin-left: auto;
+    display: inline-flex;
+    gap: 0.2rem;
+  }
+  .inspector-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+    gap: 0.5rem;
+  }
+  .inspector-grid label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    font-size: 0.85rem;
+    color: #444;
+  }
+  .inspector-grid input[type='number'] {
+    padding: 0.25rem;
+    font-size: 0.9rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .opacity-value {
+    font-variant-numeric: tabular-nums;
+    color: #666;
   }
 </style>

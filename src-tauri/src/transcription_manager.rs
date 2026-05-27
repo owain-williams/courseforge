@@ -252,6 +252,7 @@ mod tests {
                 label: "Main Display".into(),
             },
             defaults: CompositionDefaults::default(),
+            is_transcript_source: false,
         }
     }
 
@@ -278,7 +279,8 @@ mod tests {
             .start_session(&folder, &v.id, vec![screen_request()])
             .unwrap();
         rec_mgr.stop_session(&snap.id).unwrap();
-        let seg = rec_mgr.keep_session(&snap.id).unwrap();
+        let segs = rec_mgr.keep_session(&snap.id).unwrap();
+        let seg = segs.into_iter().next().expect("at least one Segment per Take");
 
         (dir, folder, v.id, seg.id)
     }

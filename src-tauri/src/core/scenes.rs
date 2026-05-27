@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::capture::{CaptureRequest, CompositionDefaults, Device, SourceRole};
+use crate::core::capture::{CaptureRequest, CompositionDefaults, Device, Position, SourceRole};
 use crate::core::error::{CoreError, Result};
 
 pub const SCENES_JSON: &str = "scenes.json";
@@ -253,6 +253,56 @@ pub fn set_scene_source_device(
         }
         s.sources[source_index].device = device;
         Ok(s.sources[source_index].clone())
+    })
+}
+
+/// Replace one source row's composition defaults (issue #39). Called by
+/// the Scene Editor canvas / inspector each time the user moves a box,
+/// resizes it, drags a slider, etc. — debounced on the frontend so the
+/// write rate is bounded.
+pub fn set_scene_source_defaults(
+    folder: &Path,
+    scene_id: &str,
+    source_index: usize,
+    defaults: CompositionDefaults,
+) -> Result<SceneSource> {
+    mutate_scenes(folder, |f| {
+        let s = find_scene_mut(f, scene_id)?;
+        if source_index >= s.sources.len() {
+            return Err(CoreError::SceneSourceIndexOutOfBounds {
+                scene_id: scene_id.to_string(),
+                index: source_index,
+                len: s.sources.len(),
+            });
+        }
+        s.sources[source_index].defaults = defaults;
+        Ok(s.sources[source_index].clone())
+    })
+}
+
+/// Move one source row to a new index inside its Scene (issue #39).
+/// Row order doubles as canvas z-order — sources later in the list paint
+/// on top of earlier ones. Out-of-bounds indices clamp to the valid
+/// range rather than erroring.
+pub fn reorder_scene_source(
+    folder: &Path,
+    scene_id: &str,
+    from_index: usize,
+    to_index: usize,
+) -> Result<()> {
+    mutate_scenes(folder, |f| {
+        let s = find_scene_mut(f, scene_id)?;
+        if from_index >= s.sources.len() {
+            return Err(CoreError::SceneSourceIndexOutOfBounds {
+                scene_id: scene_id.to_string(),
+                index: from_index,
+                len: s.sources.len(),
+            });
+        }
+        let row = s.sources.remove(from_index);
+        let to = to_index.min(s.sources.len());
+        s.sources.insert(to, row);
+        Ok(())
     })
 }
 
@@ -654,6 +704,51 @@ mod tests {
         let live = live_map([]);
         let err = build_capture_requests(&scene, &live).unwrap_err();
         assert!(matches!(err, CoreError::SceneHasNoSources { .. }));
+    }
+
+    #[test]
+    fn set_scene_source_defaults_updates_composition_block() {
+        let dir = tmp();
+        let s = create_scene(dir.path(), "A").unwrap();
+        add_scene_source(dir.path(), &s.id, SourceRole::Screen).unwrap();
+        let new_defaults = CompositionDefaults {
+            position: Position { x: 0.25, y: 0.5 },
+            scale: 0.75,
+            opacity: 0.8,
+            audio_gain_db: -6.0,
+        };
+        let updated =
+            set_scene_source_defaults(dir.path(), &s.id, 0, new_defaults).unwrap();
+        assert_eq!(updated.defaults.position.x, 0.25);
+        assert_eq!(updated.defaults.scale, 0.75);
+        let list = list_scenes(dir.path()).unwrap();
+        assert_eq!(list[0].sources[0].defaults, new_defaults);
+    }
+
+    #[test]
+    fn reorder_scene_source_moves_a_row_to_the_target_index() {
+        let dir = tmp();
+        let s = create_scene(dir.path(), "A").unwrap();
+        add_scene_source(dir.path(), &s.id, SourceRole::Screen).unwrap();
+        add_scene_source(dir.path(), &s.id, SourceRole::Camera).unwrap();
+        add_scene_source(dir.path(), &s.id, SourceRole::Microphone).unwrap();
+        // Move Camera (index 1) to the top.
+        reorder_scene_source(dir.path(), &s.id, 1, 0).unwrap();
+        let list = list_scenes(dir.path()).unwrap();
+        let roles: Vec<SourceRole> = list[0].sources.iter().map(|r| r.role).collect();
+        assert_eq!(roles, vec![SourceRole::Camera, SourceRole::Screen, SourceRole::Microphone]);
+    }
+
+    #[test]
+    fn reorder_scene_source_clamps_target_to_end_when_too_large() {
+        let dir = tmp();
+        let s = create_scene(dir.path(), "A").unwrap();
+        add_scene_source(dir.path(), &s.id, SourceRole::Screen).unwrap();
+        add_scene_source(dir.path(), &s.id, SourceRole::Camera).unwrap();
+        reorder_scene_source(dir.path(), &s.id, 0, 999).unwrap();
+        let list = list_scenes(dir.path()).unwrap();
+        let roles: Vec<SourceRole> = list[0].sources.iter().map(|r| r.role).collect();
+        assert_eq!(roles, vec![SourceRole::Camera, SourceRole::Screen]);
     }
 
     #[test]

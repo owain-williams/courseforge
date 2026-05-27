@@ -420,6 +420,36 @@ export const setSceneSourceDevice = (
     device
   });
 
+/// Persist composition defaults (position/scale/opacity/audioGainDb)
+/// for one source row in a Scene. Issue #39 — debounced on the frontend.
+export const setSceneSourceDefaults = (
+  folder: string,
+  sceneId: string,
+  sourceIndex: number,
+  defaults: CompositionDefaults
+) =>
+  invoke<SceneSource>('set_scene_source_defaults', {
+    folder,
+    sceneId,
+    sourceIndex,
+    defaults
+  });
+
+/// Move one source row to a different index inside its Scene. Row order
+/// doubles as canvas z-order — later rows paint on top of earlier ones.
+export const reorderSceneSource = (
+  folder: string,
+  sceneId: string,
+  fromIndex: number,
+  toIndex: number
+) =>
+  invoke<void>('reorder_scene_source', {
+    folder,
+    sceneId,
+    fromIndex,
+    toIndex
+  });
+
 /// Live device enumeration per role (issue #34). Queries SCK /
 /// AVCaptureDevice at call time so USB / Continuity Camera changes show up
 /// on Refresh. An empty list is not an error — the host just has no

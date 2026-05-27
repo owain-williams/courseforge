@@ -8,7 +8,7 @@ use crate::core::permissions::{
     self, PermissionsSnapshot, SettingsPane,
 };
 use crate::core::scenes::{self, Scene, SceneSource};
-use crate::core::capture::{Device, SourceRole};
+use crate::core::capture::{CompositionDefaults, Device, SourceRole};
 use crate::core::devices;
 use crate::core::segments::{self, OrphanSegment, OrphanTake, Segment};
 use crate::core::transcript::{self, Transcript};
@@ -557,6 +557,36 @@ pub fn set_scene_source_device(
 #[tauri::command]
 pub fn list_capture_devices(role: SourceRole) -> Result<Vec<Device>, AppError> {
     Ok(devices::list_capture_devices(role)?)
+}
+
+#[tauri::command]
+pub fn set_scene_source_defaults(
+    folder: PathBuf,
+    scene_id: String,
+    source_index: usize,
+    defaults: CompositionDefaults,
+) -> Result<SceneSource, AppError> {
+    Ok(scenes::set_scene_source_defaults(
+        &folder,
+        &scene_id,
+        source_index,
+        defaults,
+    )?)
+}
+
+#[tauri::command]
+pub fn reorder_scene_source(
+    folder: PathBuf,
+    scene_id: String,
+    from_index: usize,
+    to_index: usize,
+) -> Result<(), AppError> {
+    Ok(scenes::reorder_scene_source(
+        &folder,
+        &scene_id,
+        from_index,
+        to_index,
+    )?)
 }
 
 // ---------------------------------------------------------------------------

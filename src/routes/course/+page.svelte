@@ -48,8 +48,11 @@
     addSceneSource,
     removeSceneSource,
     setSceneSourceDevice,
+    setSceneSourceDefaults,
+    reorderSceneSource,
     listCaptureDevices,
     DEFAULT_DEVICE,
+    type CompositionDefaults,
     type Scene,
     type SourceRole,
     type Device,
@@ -291,6 +294,162 @@
             }
           : x
       );
+    } catch (e) {
+      error = formatError(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  // --- Scene Editor canvas + inspector (issue #39) -------------------
+
+  /// Which Scene's canvas is currently expanded. Closed by default so
+  /// the Scenes list stays compact for users with many Scenes.
+  let openCanvasForScene = $state<string | null>(null);
+
+  /// Pending debounce for setSceneSourceDefaults — one timeout per
+  /// `<sceneId>:<sourceIndex>` so each row writes at its own rate.
+  let defaultsTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /// Optimistic local edits not yet flushed to disk. Keyed the same way
+  /// so render reads from this when it exists, falling back to scenes[].
+  let pendingDefaults = $state<Record<string, CompositionDefaults>>({});
+
+  function defaultsKey(sceneId: string, sourceIndex: number): string {
+    return `${sceneId}:${sourceIndex}`;
+  }
+
+  function currentDefaults(s: Scene, i: number): CompositionDefaults {
+    return pendingDefaults[defaultsKey(s.id, i)] ?? s.sources[i].defaults;
+  }
+
+  function scheduleDefaultsWrite(s: Scene, i: number, next: CompositionDefaults) {
+    const key = defaultsKey(s.id, i);
+    pendingDefaults = { ...pendingDefaults, [key]: next };
+    const existing = defaultsTimers.get(key);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(async () => {
+      defaultsTimers.delete(key);
+      if (!folder) return;
+      try {
+        const updated = await setSceneSourceDefaults(folder, s.id, i, next);
+        scenes = scenes.map((x) =>
+          x.id === s.id
+            ? {
+                ...x,
+                sources: x.sources.map((src, idx) => (idx === i ? updated : src))
+              }
+            : x
+        );
+        // Drop the optimistic entry now the canonical value is on disk.
+        const copy = { ...pendingDefaults };
+        delete copy[key];
+        pendingDefaults = copy;
+      } catch (e) {
+        error = formatError(e);
+      }
+    }, 250);
+    defaultsTimers.set(key, timer);
+  }
+
+  function flipMuted(s: Scene, i: number) {
+    const cur = currentDefaults(s, i);
+    const next: CompositionDefaults = {
+      ...cur,
+      audioGainDb: cur.audioGainDb === Number.NEGATIVE_INFINITY ? 0 : Number.NEGATIVE_INFINITY
+    };
+    scheduleDefaultsWrite(s, i, next);
+  }
+
+  function clamp(v: number, lo: number, hi: number): number {
+    return Math.max(lo, Math.min(hi, v));
+  }
+
+  function isAudioOnly(role: SourceRole): boolean {
+    return role === 'microphone' || role === 'systemAudio';
+  }
+
+  // Drag state for the canvas. Tracked per dragging operation so we can
+  // restore on Escape.
+  let dragState = $state<{
+    sceneId: string;
+    sourceIndex: number;
+    mode: 'move' | 'resize';
+    startX: number;
+    startY: number;
+    startDefaults: CompositionDefaults;
+    canvasWidth: number;
+    canvasHeight: number;
+  } | null>(null);
+
+  function startBoxDrag(
+    e: PointerEvent,
+    s: Scene,
+    i: number,
+    mode: 'move' | 'resize'
+  ) {
+    e.preventDefault();
+    const canvas = (e.currentTarget as HTMLElement).closest('.scene-canvas') as HTMLElement | null;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    dragState = {
+      sceneId: s.id,
+      sourceIndex: i,
+      mode,
+      startX: e.clientX,
+      startY: e.clientY,
+      startDefaults: { ...currentDefaults(s, i) },
+      canvasWidth: rect.width,
+      canvasHeight: rect.height
+    };
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  }
+
+  function onBoxDragMove(e: PointerEvent) {
+    if (!dragState) return;
+    const dx = (e.clientX - dragState.startX) / dragState.canvasWidth;
+    const dy = (e.clientY - dragState.startY) / dragState.canvasHeight;
+    const s = scenes.find((x) => x.id === dragState!.sceneId);
+    if (!s) return;
+    const start = dragState.startDefaults;
+    if (dragState.mode === 'move') {
+      const next: CompositionDefaults = {
+        ...start,
+        position: {
+          x: clamp(start.position.x + dx, 0, 1),
+          y: clamp(start.position.y + dy, 0, 1)
+        }
+      };
+      scheduleDefaultsWrite(s, dragState.sourceIndex, next);
+    } else {
+      // Resize: scale tracks horizontal delta (1.0 = fills canvas).
+      const next: CompositionDefaults = {
+        ...start,
+        scale: clamp(start.scale + dx, 0.05, 2)
+      };
+      scheduleDefaultsWrite(s, dragState.sourceIndex, next);
+    }
+  }
+
+  function endBoxDrag(e: PointerEvent) {
+    if (!dragState) return;
+    (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
+    dragState = null;
+  }
+
+  async function moveSourceRow(s: Scene, fromIndex: number, delta: number) {
+    if (!folder) return;
+    const toIndex = clamp(fromIndex + delta, 0, s.sources.length - 1);
+    if (toIndex === fromIndex) return;
+    busy = true;
+    try {
+      await reorderSceneSource(folder, s.id, fromIndex, toIndex);
+      scenes = scenes.map((x) => {
+        if (x.id !== s.id) return x;
+        const rows = [...x.sources];
+        const [row] = rows.splice(fromIndex, 1);
+        rows.splice(toIndex, 0, row);
+        return { ...x, sources: rows };
+      });
     } catch (e) {
       error = formatError(e);
     } finally {
@@ -2113,6 +2272,14 @@
                   </button>
                 {/if}
                 <div class="actions">
+                  <button
+                    class="ghost"
+                    disabled={busy}
+                    onclick={() =>
+                      (openCanvasForScene = openCanvasForScene === s.id ? null : s.id)}
+                  >
+                    {openCanvasForScene === s.id ? 'Hide Canvas' : 'Open Canvas'}
+                  </button>
                   <button class="ghost" disabled={busy} onclick={() => dupScene(s)}>
                     Duplicate
                   </button>
@@ -2121,6 +2288,188 @@
                   </button>
                 </div>
               </header>
+
+              {#if openCanvasForScene === s.id}
+                <div class="scene-editor">
+                  <div
+                    class="scene-canvas"
+                    aria-label="Scene canvas preview (1920×1080)"
+                  >
+                    {#each s.sources as src, i (i)}
+                      {@const d = currentDefaults(s, i)}
+                      {#if !isAudioOnly(src.role)}
+                        <div
+                          class="canvas-box"
+                          style="
+                            left: {d.position.x * 100}%;
+                            top: {d.position.y * 100}%;
+                            width: {d.scale * 100}%;
+                            height: {d.scale * 100 * (9 / 16)}%;
+                            opacity: {d.opacity};
+                            z-index: {i + 1};
+                          "
+                          aria-label="{sourceRoleLabel(src.role)} canvas box"
+                        >
+                          <div
+                            class="box-body"
+                            role="button"
+                            tabindex="0"
+                            onpointerdown={(e) => startBoxDrag(e, s, i, 'move')}
+                            onpointermove={onBoxDragMove}
+                            onpointerup={endBoxDrag}
+                            onpointercancel={endBoxDrag}
+                          >
+                            <span class="box-label">
+                              {sourceRoleLabel(src.role)} — {src.device.label}
+                            </span>
+                          </div>
+                          <div
+                            class="box-resize"
+                            role="button"
+                            tabindex="0"
+                            aria-label="Resize"
+                            onpointerdown={(e) => startBoxDrag(e, s, i, 'resize')}
+                            onpointermove={onBoxDragMove}
+                            onpointerup={endBoxDrag}
+                            onpointercancel={endBoxDrag}
+                          ></div>
+                        </div>
+                      {/if}
+                    {/each}
+                  </div>
+
+                  <div class="audio-chips" aria-label="Audio-only sources">
+                    {#each s.sources as src, i (i)}
+                      {#if isAudioOnly(src.role)}
+                        {@const d = currentDefaults(s, i)}
+                        <div class="audio-chip">
+                          <span class="chip-role">{sourceRoleLabel(src.role)}</span>
+                          <span class="chip-device">{src.device.label}</span>
+                          <label class="audio-gain">
+                            Gain
+                            <input
+                              type="range"
+                              min="-60"
+                              max="12"
+                              step="0.5"
+                              disabled={d.audioGainDb === Number.NEGATIVE_INFINITY}
+                              value={d.audioGainDb === Number.NEGATIVE_INFINITY ? -60 : d.audioGainDb}
+                              oninput={(e) => {
+                                const v = parseFloat((e.target as HTMLInputElement).value);
+                                scheduleDefaultsWrite(s, i, { ...d, audioGainDb: v });
+                              }}
+                            />
+                            <span class="gain-value">
+                              {d.audioGainDb === Number.NEGATIVE_INFINITY ? 'muted' : `${d.audioGainDb.toFixed(1)} dB`}
+                            </span>
+                          </label>
+                          <button class="ghost mute" onclick={() => flipMuted(s, i)}>
+                            {d.audioGainDb === Number.NEGATIVE_INFINITY ? 'Unmute' : 'Mute'}
+                          </button>
+                        </div>
+                      {/if}
+                    {/each}
+                  </div>
+
+                  <div class="inspector" aria-label="Source inspector">
+                    {#each s.sources as src, i (i)}
+                      {@const d = currentDefaults(s, i)}
+                      <div class="inspector-row">
+                        <header>
+                          <span class="chip-role">{sourceRoleLabel(src.role)}</span>
+                          <span class="chip-device">{src.device.label}</span>
+                          <span class="z-actions">
+                            <button
+                              class="ghost"
+                              disabled={busy || i === 0}
+                              onclick={() => moveSourceRow(s, i, -1)}
+                              aria-label="Move up (z-order)"
+                              title="Move up"
+                            >↑</button>
+                            <button
+                              class="ghost"
+                              disabled={busy || i === s.sources.length - 1}
+                              onclick={() => moveSourceRow(s, i, 1)}
+                              aria-label="Move down (z-order)"
+                              title="Move down"
+                            >↓</button>
+                          </span>
+                        </header>
+                        {#if !isAudioOnly(src.role)}
+                          <div class="inspector-grid">
+                            <label>
+                              Position X
+                              <input
+                                type="number"
+                                step="0.01"
+                                min="0"
+                                max="1"
+                                value={d.position.x.toFixed(3)}
+                                oninput={(e) => {
+                                  const v = parseFloat((e.target as HTMLInputElement).value);
+                                  if (Number.isFinite(v))
+                                    scheduleDefaultsWrite(s, i, {
+                                      ...d,
+                                      position: { ...d.position, x: clamp(v, 0, 1) }
+                                    });
+                                }}
+                              />
+                            </label>
+                            <label>
+                              Position Y
+                              <input
+                                type="number"
+                                step="0.01"
+                                min="0"
+                                max="1"
+                                value={d.position.y.toFixed(3)}
+                                oninput={(e) => {
+                                  const v = parseFloat((e.target as HTMLInputElement).value);
+                                  if (Number.isFinite(v))
+                                    scheduleDefaultsWrite(s, i, {
+                                      ...d,
+                                      position: { ...d.position, y: clamp(v, 0, 1) }
+                                    });
+                                }}
+                              />
+                            </label>
+                            <label>
+                              Scale
+                              <input
+                                type="number"
+                                step="0.05"
+                                min="0.05"
+                                max="2"
+                                value={d.scale.toFixed(2)}
+                                oninput={(e) => {
+                                  const v = parseFloat((e.target as HTMLInputElement).value);
+                                  if (Number.isFinite(v))
+                                    scheduleDefaultsWrite(s, i, { ...d, scale: clamp(v, 0.05, 2) });
+                                }}
+                              />
+                            </label>
+                            <label>
+                              Opacity
+                              <input
+                                type="range"
+                                min="0"
+                                max="1"
+                                step="0.01"
+                                value={d.opacity}
+                                oninput={(e) => {
+                                  const v = parseFloat((e.target as HTMLInputElement).value);
+                                  scheduleDefaultsWrite(s, i, { ...d, opacity: clamp(v, 0, 1) });
+                                }}
+                              />
+                              <span class="opacity-value">{(d.opacity * 100).toFixed(0)}%</span>
+                            </label>
+                          </div>
+                        {/if}
+                      </div>
+                    {/each}
+                  </div>
+                </div>
+              {/if}
 
               <ul class="source-rows" aria-label="Source roles for {s.name}">
                 {#each s.sources as src, i (i)}
@@ -3097,5 +3446,128 @@
     gap: 0.4rem;
     font-size: 0.9rem;
     color: #444;
+  }
+
+  /* Scene editor canvas + inspector (issue #39). */
+  .scene-editor {
+    margin-top: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+  .scene-canvas {
+    position: relative;
+    aspect-ratio: 16 / 9;
+    width: 100%;
+    background: linear-gradient(135deg, #1d1f25, #2a2f3a);
+    border: 1px solid #444;
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .canvas-box {
+    position: absolute;
+    border: 1px solid #99baff;
+    background: rgba(63, 122, 224, 0.18);
+    box-sizing: border-box;
+    min-width: 30px;
+    min-height: 18px;
+  }
+  .canvas-box .box-body {
+    width: 100%;
+    height: 100%;
+    cursor: move;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.25rem;
+  }
+  .canvas-box .box-label {
+    color: #fff;
+    font-size: 0.75rem;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+    text-align: center;
+    pointer-events: none;
+  }
+  .canvas-box .box-resize {
+    position: absolute;
+    right: -6px;
+    bottom: -6px;
+    width: 14px;
+    height: 14px;
+    background: #99baff;
+    border: 1px solid #fff;
+    border-radius: 2px;
+    cursor: nwse-resize;
+  }
+  .audio-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+  .audio-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    padding: 0.35rem 0.6rem;
+    font-size: 0.85rem;
+  }
+  .audio-chip .audio-gain {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .audio-chip .gain-value {
+    font-variant-numeric: tabular-nums;
+    min-width: 4.5rem;
+    text-align: right;
+  }
+  .audio-chip .mute {
+    font-size: 0.8rem;
+  }
+  .inspector {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .inspector-row {
+    border: 1px solid #e0e0e0;
+    border-radius: 6px;
+    padding: 0.5rem;
+    background: #fff;
+  }
+  .inspector-row header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.4rem;
+  }
+  .inspector-row header .z-actions {
+    margin-left: auto;
+    display: inline-flex;
+    gap: 0.2rem;
+  }
+  .inspector-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+    gap: 0.5rem;
+  }
+  .inspector-grid label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    font-size: 0.85rem;
+    color: #444;
+  }
+  .inspector-grid input[type='number'] {
+    padding: 0.25rem;
+    font-size: 0.9rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .opacity-value {
+    font-variant-numeric: tabular-nums;
+    color: #666;
   }
 </style>

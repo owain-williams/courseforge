@@ -128,18 +128,44 @@ impl RecordingManager {
             video_id.to_string(),
             slots,
             take_id.clone(),
-            recorded_at,
+            recorded_at.clone(),
         );
 
-        // Spin up the backend first; if it fails we leave nothing behind (the
-        // empty segments/ dir is harmless) and the session never enters the
-        // registry, so callers get a clean error — Atomic Start across N
-        // sources (the backend is responsible for tearing down any
-        // partially-initialised writers itself).
-        let recording = self.backend.start(TakeRequest {
-            take_id,
+        // Issue #38: write the Take marker before the backend starts so
+        // a crash *during* backend init still leaves a marker for
+        // recovery. Failure to write the marker is fatal — the
+        // alternative is "we recorded but can't recover on crash" which
+        // beats the whole point.
+        let marker = segments::TakeMarker {
+            schema_version: segments::TakeMarker::SCHEMA_VERSION,
+            take_id: take_id.clone(),
+            video_id: video_id.to_string(),
+            recorded_at: recorded_at.clone(),
+            scene_id: None, // Phase 2 doesn't thread scene_id through start_session yet.
+            sources: session
+                .slots
+                .iter()
+                .map(|slot| segments::TakeMarkerSource {
+                    segment_id: slot.segment_id.clone(),
+                    request: slot.request.clone(),
+                })
+                .collect(),
+        };
+        segments::write_take_marker(course_folder, video_id, &marker)?;
+
+        // Spin up the backend; if it fails we tear down the marker as
+        // well so the next-launch scanner doesn't surface a Take that
+        // never actually wrote anything to disk.
+        let recording = match self.backend.start(TakeRequest {
+            take_id: take_id.clone(),
             sources: take_sources,
-        })?;
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = segments::remove_take_marker(course_folder, video_id, &take_id);
+                return Err(e);
+            }
+        };
         session.start()?;
 
         let id = session.id.clone();
@@ -199,6 +225,13 @@ impl RecordingManager {
             .ok_or_else(|| CoreError::SessionNotFound(id.to_string()))?;
         entry.outcomes = outcomes;
         entry.session.stop()?;
+        // Take marker removed on clean Stop — a crash before this point
+        // leaves the marker behind for orphan recovery (issue #38).
+        let _ = segments::remove_take_marker(
+            &entry.course_folder,
+            &entry.session.video_id,
+            &entry.session.take_id,
+        );
         Ok(entry.snapshot())
     }
 
@@ -280,6 +313,70 @@ impl RecordingManager {
         Ok(out)
     }
 
+    /// Adopt every Segment in one crashed Take (issue #38). Reads the
+    /// Take marker, calls `adopt_orphan` per source with a sidecar
+    /// carrying the marker's role/device/defaults + `EndedReason::Crashed`,
+    /// then removes the marker. v1 legacy orphans (no marker) fall
+    /// through to the per-file `adopt_orphan` path the UI keeps for
+    /// single-Segment Takes.
+    pub fn adopt_orphan_take(
+        &self,
+        course_folder: &Path,
+        video_id: &str,
+        take_id: &str,
+    ) -> Result<Vec<segments::Segment>> {
+        let marker = segments::read_take_marker(course_folder, video_id, take_id)?;
+        let marker = match marker {
+            Some(m) => m,
+            None => {
+                return Err(CoreError::Recorder(format!(
+                    "no in-progress Take marker for {take_id} — the Take may have already been adopted or discarded"
+                )))
+            }
+        };
+        let mut out = Vec::with_capacity(marker.sources.len());
+        for src in &marker.sources {
+            let sidecar = SegmentSidecar::new(
+                marker.take_id.clone(),
+                src.request.role,
+                src.request.device.clone(),
+                marker.recorded_at.clone(),
+                src.request.defaults,
+                EndedReason::Crashed,
+            );
+            let seg = segments::adopt_orphan(
+                course_folder,
+                video_id,
+                &src.segment_id,
+                sidecar,
+                legacy_remux_mkv_to_mp4,
+            )?;
+            out.push(seg);
+        }
+        // Marker removed last so a crash mid-import leaves the rest of
+        // the Take adoptable on the next attempt.
+        let _ = segments::remove_take_marker(course_folder, video_id, take_id);
+        Ok(out)
+    }
+
+    /// Discard every Segment in one crashed Take. Removes all partials
+    /// plus the Take marker; safe to call multiple times.
+    pub fn discard_orphan_take(
+        &self,
+        course_folder: &Path,
+        video_id: &str,
+        take_id: &str,
+    ) -> Result<()> {
+        let marker = segments::read_take_marker(course_folder, video_id, take_id)?;
+        if let Some(marker) = marker {
+            for src in &marker.sources {
+                segments::discard_partial(course_folder, video_id, &src.segment_id)?;
+            }
+        }
+        segments::remove_take_marker(course_folder, video_id, take_id)?;
+        Ok(())
+    }
+
     /// Adopt a crash-recovered partial as a finished Segment. Handles both
     /// the new `.partial.mov` shape (rename + sidecar with `endedReason:
     /// crashed`, using a Phase-1-shaped sidecar built from a synthetic Take)
@@ -339,6 +436,11 @@ impl RecordingManager {
                 &slot.segment_id,
             )?;
         }
+        let _ = segments::remove_take_marker(
+            &entry.course_folder,
+            &entry.session.video_id,
+            &entry.session.take_id,
+        );
         sessions.remove(id);
         Ok(())
     }
@@ -789,6 +891,129 @@ mod tests {
                 .unwrap()
                 .state,
             SessionState::Recording
+        );
+    }
+
+    #[test]
+    fn start_session_writes_a_take_marker_to_disk() {
+        let (dir, vid) = course_with_video();
+        let (mgr, _) = manager();
+        let snap = mgr
+            .start_session(&course_folder(&dir), &vid, vec![screen_request()])
+            .unwrap();
+        let marker = segments::read_take_marker(&course_folder(&dir), &vid, &snap.take_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(marker.take_id, snap.take_id);
+        assert_eq!(marker.video_id, vid);
+        assert_eq!(marker.sources.len(), 1);
+    }
+
+    #[test]
+    fn clean_stop_removes_the_take_marker() {
+        let (dir, vid) = course_with_video();
+        let (mgr, _) = manager();
+        let snap = mgr
+            .start_session(&course_folder(&dir), &vid, vec![screen_request()])
+            .unwrap();
+        mgr.stop_session(&snap.id).unwrap();
+        assert!(
+            segments::read_take_marker(&course_folder(&dir), &vid, &snap.take_id)
+                .unwrap()
+                .is_none(),
+            "clean Stop should have removed the in-progress marker"
+        );
+    }
+
+    #[test]
+    fn adopt_orphan_take_imports_every_segment_atomically() {
+        // Simulate a crashed multi-source Take by writing the marker +
+        // both partials by hand, then call adopt_orphan_take and assert
+        // both Segments came back finalised with the right sidecars.
+        let (dir, vid) = course_with_video();
+        let (mgr, _) = manager();
+        let segs_dir = course_folder(&dir).join("videos").join(&vid).join("segments");
+        std::fs::create_dir_all(&segs_dir).unwrap();
+        // Two partials, one screen .mov, one mic .m4a — fake the contents.
+        std::fs::write(segs_dir.join("seg-screen.partial.mov"), b"FAKE").unwrap();
+        std::fs::write(segs_dir.join("seg-mic.partial.m4a"), b"FAKE").unwrap();
+        let mic_request = CaptureRequest {
+            role: SourceRole::Microphone,
+            device: Device {
+                id: "default".into(),
+                label: "Default Mic".into(),
+            },
+            defaults: CompositionDefaults::default(),
+        };
+        let marker = segments::TakeMarker {
+            schema_version: segments::TakeMarker::SCHEMA_VERSION,
+            take_id: "take-crashed".into(),
+            video_id: vid.clone(),
+            recorded_at: "2026-05-27T01:00:00Z".into(),
+            scene_id: None,
+            sources: vec![
+                segments::TakeMarkerSource {
+                    segment_id: "seg-screen".into(),
+                    request: screen_request(),
+                },
+                segments::TakeMarkerSource {
+                    segment_id: "seg-mic".into(),
+                    request: mic_request,
+                },
+            ],
+        };
+        segments::write_take_marker(&course_folder(&dir), &vid, &marker).unwrap();
+
+        let segs = mgr
+            .adopt_orphan_take(&course_folder(&dir), &vid, "take-crashed")
+            .unwrap();
+        assert_eq!(segs.len(), 2);
+
+        // Both sidecars carry the take-id + Crashed reason.
+        for seg in &segs {
+            let sidecar = segments::read_sidecar(&course_folder(&dir), &vid, &seg.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(sidecar.take_id, "take-crashed");
+            assert_eq!(sidecar.ended_reason, EndedReason::Crashed);
+        }
+
+        // Marker is gone; partials are gone; finals are in place.
+        assert!(
+            segments::read_take_marker(&course_folder(&dir), &vid, "take-crashed")
+                .unwrap()
+                .is_none()
+        );
+        assert!(segs_dir.join("seg-screen.mov").is_file());
+        assert!(segs_dir.join("seg-mic.m4a").is_file());
+    }
+
+    #[test]
+    fn discard_orphan_take_removes_marker_and_every_partial() {
+        let (dir, vid) = course_with_video();
+        let (mgr, _) = manager();
+        let segs_dir = course_folder(&dir).join("videos").join(&vid).join("segments");
+        std::fs::create_dir_all(&segs_dir).unwrap();
+        std::fs::write(segs_dir.join("seg-a.partial.mov"), b"FAKE").unwrap();
+        let marker = segments::TakeMarker {
+            schema_version: segments::TakeMarker::SCHEMA_VERSION,
+            take_id: "doomed".into(),
+            video_id: vid.clone(),
+            recorded_at: "2026-05-27T01:00:00Z".into(),
+            scene_id: None,
+            sources: vec![segments::TakeMarkerSource {
+                segment_id: "seg-a".into(),
+                request: screen_request(),
+            }],
+        };
+        segments::write_take_marker(&course_folder(&dir), &vid, &marker).unwrap();
+        mgr.discard_orphan_take(&course_folder(&dir), &vid, "doomed")
+            .unwrap();
+        assert!(!segs_dir.join("seg-a.partial.mov").exists());
+        assert!(
+            segments::read_take_marker(&course_folder(&dir), &vid, "doomed")
+                .unwrap()
+                .is_none()
         );
     }
 

@@ -36,6 +36,10 @@
     scanOrphanSegments,
     importOrphanSegment,
     discardOrphanSegment,
+    scanOrphanTakes,
+    importOrphanTake,
+    discardOrphanTake,
+    type OrphanTake,
     listScenes,
     createScene,
     renameScene,
@@ -651,6 +655,9 @@
   let sessionsByVideo = $state<Record<string, SessionSnapshot>>({});
   let segmentsByVideo = $state<Record<string, Segment[]>>({});
   let orphans = $state<OrphanSegment[]>([]);
+  /// Issue #38 — per-Take grouping of crashed partials. Each row is one
+  /// Take; Import / Discard act on every Segment in it at once.
+  let orphanTakes = $state<OrphanTake[]>([]);
   let recordingSources = $state<CaptureSources>({
     microphone: true,
     systemAudio: false,
@@ -714,10 +721,43 @@
   async function refreshOrphans() {
     if (!folder) return;
     try {
-      orphans = await scanOrphanSegments(folder);
+      // Prefer the per-Take grouped view; fall back to the per-Segment
+      // shape only if the new command fails (e.g. a v1 backend that
+      // doesn't have it). The per-Segment list also still drives the
+      // single-Segment fallback path for v1 .partial.mkv orphans.
+      const [perTake, perSegment] = await Promise.all([
+        scanOrphanTakes(folder).catch(() => []),
+        scanOrphanSegments(folder).catch(() => [])
+      ]);
+      orphanTakes = perTake;
+      orphans = perSegment;
     } catch (e) {
       console.warn('scanOrphans failed', e);
     }
+  }
+
+  async function importOrphanTakeRow(t: OrphanTake) {
+    if (!folder) return;
+    await withBusy(async () => {
+      await importOrphanTake(folder!, t.videoId, t.takeId);
+      await Promise.all([refreshOrphans(), refreshSegments(t.videoId)]);
+    });
+  }
+
+  async function dropOrphanTakeRow(t: OrphanTake) {
+    if (!folder) return;
+    if (
+      !confirm(
+        `Discard this recovered Take (${t.segments.length} source${
+          t.segments.length === 1 ? '' : 's'
+        })? The files will be deleted.`
+      )
+    )
+      return;
+    await withBusy(async () => {
+      await discardOrphanTake(folder!, t.videoId, t.takeId);
+      await refreshOrphans();
+    });
   }
 
   async function refreshPermissions() {
@@ -1395,27 +1435,36 @@
     <div class="error" role="alert">{error}</div>
   {/if}
 
-  {#if orphans.length > 0}
-    <section class="orphan-banner" aria-label="Recovered recordings">
-      <h2>Recovered recording{orphans.length === 1 ? '' : 's'}</h2>
+  {#if orphanTakes.length > 0}
+    <section class="orphan-banner" aria-label="Recovered Takes">
+      <h2>Recovered Take{orphanTakes.length === 1 ? '' : 's'}</h2>
       <p class="hint">
-        {orphans.length === 1
+        {orphanTakes.length === 1
           ? 'A previous recording session was interrupted.'
-          : `${orphans.length} previous recording sessions were interrupted.`}
-        The captured file{orphans.length === 1 ? '' : 's'} may still be usable.
+          : `${orphanTakes.length} previous recording sessions were interrupted.`}
+        Import to keep every source in the Take, or Discard to delete the files.
       </p>
       <ul class="orphan-list">
-        {#each orphans as o (`${o.videoId}:${o.id}`)}
+        {#each orphanTakes as t (`${t.videoId}:${t.takeId}`)}
           <li>
             <div class="orphan-meta">
-              <strong>{videoTitleForOrphan(o)}</strong>
-              <code title={o.path}>{o.path}</code>
+              <strong>{videoTitleForOrphan({ videoId: t.videoId, id: t.takeId, path: '' } as OrphanSegment)}</strong>
+              <span class="orphan-chips">
+                {#each t.segments as s (s.segmentId)}
+                  <span class="chip">
+                    <span class="chip-role">{sourceRoleLabel(s.sourceRole)}</span>
+                  </span>
+                {/each}
+              </span>
+              {#if t.recordedAt}
+                <code title={t.recordedAt}>{t.recordedAt}</code>
+              {/if}
             </div>
             <div class="actions">
-              <button class="primary" disabled={busy} onclick={() => importOrphan(o)}>
-                Import
+              <button class="primary" disabled={busy} onclick={() => importOrphanTakeRow(t)}>
+                Import {t.segments.length === 1 ? 'Take' : `Take (${t.segments.length} sources)`}
               </button>
-              <button class="ghost" disabled={busy} onclick={() => dropOrphan(o)}>
+              <button class="ghost" disabled={busy} onclick={() => dropOrphanTakeRow(t)}>
                 Discard
               </button>
             </div>

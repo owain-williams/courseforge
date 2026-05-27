@@ -343,6 +343,33 @@ export const importOrphanSegment = (folder: string, videoId: string, segmentId: 
 export const discardOrphanSegment = (folder: string, videoId: string, segmentId: string) =>
   invoke<void>('discard_orphan_segment', { folder, videoId, segmentId });
 
+// --- Per-Take orphan recovery (issue #38) ---
+
+export type OrphanTakeSegment = {
+  segmentId: string;
+  sourceRole: SourceRole;
+  partialPath: string;
+};
+
+export type OrphanTake = {
+  takeId: string;
+  videoId: string;
+  /// ISO-8601 timestamp from the Take marker, or null for v1 legacy
+  /// orphans that predate Take markers.
+  recordedAt: string | null;
+  sceneId: string | null;
+  segments: OrphanTakeSegment[];
+};
+
+export const scanOrphanTakes = (folder: string) =>
+  invoke<OrphanTake[]>('scan_orphan_takes', { folder });
+
+export const importOrphanTake = (folder: string, videoId: string, takeId: string) =>
+  invoke<Segment[]>('import_orphan_take', { folder, videoId, takeId });
+
+export const discardOrphanTake = (folder: string, videoId: string, takeId: string) =>
+  invoke<void>('discard_orphan_take', { folder, videoId, takeId });
+
 // ---------------------------------------------------------------------------
 // Scenes (Phase 2 — issue #33)
 // ---------------------------------------------------------------------------

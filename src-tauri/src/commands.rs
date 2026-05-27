@@ -10,7 +10,7 @@ use crate::core::permissions::{
 use crate::core::scenes::{self, Scene, SceneSource};
 use crate::core::capture::{Device, SourceRole};
 use crate::core::devices;
-use crate::core::segments::{self, OrphanSegment, Segment};
+use crate::core::segments::{self, OrphanSegment, OrphanTake, Segment};
 use crate::core::transcript::{self, Transcript};
 use crate::export_manager::{ExportJob, ExportManager};
 use crate::recording_manager::{RecordingManager, SessionSnapshot};
@@ -455,6 +455,37 @@ pub fn discard_orphan_segment(
     segment_id: String,
 ) -> Result<(), AppError> {
     Ok(segments::discard_partial(&folder, &video_id, &segment_id)?)
+}
+
+// --- Per-Take orphan recovery (issue #38) ---
+
+#[tauri::command]
+pub fn scan_orphan_takes(folder: PathBuf) -> Result<Vec<OrphanTake>, AppError> {
+    Ok(segments::scan_orphan_takes(&folder)?)
+}
+
+#[tauri::command]
+pub fn import_orphan_take(
+    manager: tauri::State<'_, RecordingManager>,
+    transcription: tauri::State<'_, TranscriptionManager>,
+    folder: PathBuf,
+    video_id: String,
+    take_id: String,
+) -> Result<Vec<Segment>, AppError> {
+    let segs = manager.adopt_orphan_take(&folder, &video_id, &take_id)?;
+    // Queue transcription on the Video once for the whole Take.
+    transcription.enqueue(folder, video_id);
+    Ok(segs)
+}
+
+#[tauri::command]
+pub fn discard_orphan_take(
+    manager: tauri::State<'_, RecordingManager>,
+    folder: PathBuf,
+    video_id: String,
+    take_id: String,
+) -> Result<(), AppError> {
+    Ok(manager.discard_orphan_take(&folder, &video_id, &take_id)?)
 }
 
 // ---------------------------------------------------------------------------
